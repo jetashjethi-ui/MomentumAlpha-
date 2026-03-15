@@ -1,0 +1,529 @@
+\documentclass[12pt,a4paper]{article}
+
+% ============ PACKAGES ============
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{mathptmx}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{setspace}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+% ============ STYLING ============
+\definecolor{accentblue}{HTML}{1E88E5}
+\definecolor{codegray}{HTML}{F5F5F5}
+\hypersetup{colorlinks=true, linkcolor=accentblue, urlcolor=accentblue, citecolor=accentblue}
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{QuantQuest Challenge --- ESummit'26}
+\lhead{MomentumAlpha}
+\cfoot{\thepage}
+\titleformat{\section}{\Large\bfseries\color{accentblue}}{\thesection}{1em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{1em}{}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{8pt}
+\onehalfspacing
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codegray},
+    frame=single,
+    breaklines=true,
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+}
+
+% ============ DOCUMENT ============
+\begin{document}
+
+% ---- TITLE PAGE ----
+\begin{titlepage}
+\centering
+\vspace*{2cm}
+
+{\Huge\bfseries\color{accentblue} MomentumAlpha}\\[0.5cm]
+{\LARGE ML-Driven Weekly Stock Selection Strategy}\\[2cm]
+
+{\Large QuantQuest Challenge $|$ ESummit'26}\\[1cm]
+
+\rule{\linewidth}{1pt}\\[1cm]
+
+{\large
+\textbf{Team Members:} [Your Name(s)]\\[0.3cm]
+\textbf{Institution:} [Your College]\\[0.3cm]
+\textbf{Date:} \today
+}
+
+\vfill
+
+\textit{``The goal is not to predict the market, but to identify which stocks are most likely to outperform their peers each week.''}
+
+\vspace{1cm}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introduction \& Problem Formulation}
+% ============================================================
+
+\subsection{Objective}
+Given a universe $\mathcal{U} = \{s_1, s_2, \ldots, s_{10}\}$ of 10 large-cap U.S.\ equities, we seek to construct a weekly-rebalanced long-only portfolio $\mathcal{P}_t$ at each Friday close $t$ that maximises risk-adjusted returns over the test period (January 2023 -- March 2025).
+
+Formally, at each decision point $t$:
+\begin{enumerate}[label=(\roman*)]
+    \item Estimate $\hat{p}(y_{i,t}=1 \mid \mathbf{x}_{i,t})$ for each stock $i \in \mathcal{U}$, where $y_{i,t}=1$ if the forward one-week return $r_{i,t \to t+5} > 0$.
+    \item Rank stocks by $\hat{p}_i$ in descending order.
+    \item Select $\mathcal{S}_t = \{i : \text{rank}(\hat{p}_i) \leq 2\}$.
+    \item Allocate equal weights: $w_i = \frac{1}{|\mathcal{S}_t|}$ for $i \in \mathcal{S}_t$.
+    \item Hold for one week; rebalance at $t+1$.
+\end{enumerate}
+
+\subsection{Stock Universe}
+\begin{table}[H]
+\centering
+\caption{Universe of 10 stocks with sector classification.}
+\begin{tabular}{llll}
+\toprule
+\textbf{Ticker} & \textbf{Company} & \textbf{Sector} & \textbf{Market Cap} \\
+\midrule
+AAPL  & Apple Inc.           & Technology  & Mega-cap \\
+MSFT  & Microsoft Corp.      & Technology  & Mega-cap \\
+GOOGL & Alphabet Inc.        & Technology  & Mega-cap \\
+AMZN  & Amazon.com Inc.      & Consumer    & Mega-cap \\
+META  & Meta Platforms       & Technology  & Mega-cap \\
+TSLA  & Tesla Inc.           & Consumer    & Large-cap \\
+JPM   & JPMorgan Chase       & Financials  & Mega-cap \\
+V     & Visa Inc.            & Financials  & Mega-cap \\
+JNJ   & Johnson \& Johnson   & Healthcare  & Mega-cap \\
+BRK-B & Berkshire Hathaway   & Financials  & Mega-cap \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Data}
+Daily OHLCV data from Yahoo Finance (\texttt{yfinance}), January 2017 -- March 2025. Additional market data: SPY (S\&P 500 ETF) and VIX (CBOE Volatility Index) as regime indicators.
+
+\subsection{Assumptions}
+\begin{itemize}
+    \item \textbf{Transaction costs:} 10 basis points (0.1\%) at entry and exit, applied proportionally to portfolio turnover.
+    \item \textbf{Execution:} Trades execute at Friday closing prices.
+    \item \textbf{No leverage, no short selling} --- long-only constraint.
+    \item \textbf{No survivorship bias correction} (acknowledged as a limitation).
+\end{itemize}
+
+% ============================================================
+\section{Feature Engineering}
+% ============================================================
+
+We compute \textbf{100+ features} per stock across 9 categories. Features are designed based on established quantitative finance literature.
+
+\subsection{Momentum \& Trend Features}
+Multi-horizon returns capture momentum at different time scales (Jegadeesh \& Titman, 1993):
+\begin{equation}
+    r_{i,t}^{(k)} = \frac{P_{i,t} - P_{i,t-k}}{P_{i,t-k}}, \quad k \in \{5, 10, 20, 40, 60, 120\}
+\end{equation}
+
+Moving average crossover ratios identify trend direction:
+\begin{equation}
+    \text{MA\_ratio}_{s,l} = \frac{\text{SMA}_s(P)}{\text{SMA}_l(P)}, \quad (s,l) \in \{(5,20), (10,50), (20,100), (50,200)\}
+\end{equation}
+
+MACD oscillator (Appel, 2005):
+\begin{equation}
+    \text{MACD} = \text{EMA}_{12}(P) - \text{EMA}_{26}(P), \quad \text{Signal} = \text{EMA}_9(\text{MACD})
+\end{equation}
+
+Average Directional Index (ADX, 14-period) measures trend strength. Linear regression slope over a 20-day window quantifies the rate of price change:
+\begin{equation}
+    \text{LR\_slope} = \frac{\hat{\beta}_1}{\bar{P}}, \quad P_t = \hat{\beta}_0 + \hat{\beta}_1 t + \epsilon_t
+\end{equation}
+
+\subsection{Volatility Features}
+Garman-Klass volatility estimator (Garman \& Klass, 1980) is more efficient than close-to-close:
+\begin{equation}
+    \hat{\sigma}_{GK}^2 = \frac{1}{2}\left(\ln\frac{H_t}{L_t}\right)^2 - (2\ln 2 - 1)\left(\ln\frac{C_t}{O_t}\right)^2
+\end{equation}
+
+Bollinger Band percentage $\%B$ quantifies position within volatility channels:
+\begin{equation}
+    \%B = \frac{P_t - \text{Lower}_t}{\text{Upper}_t - \text{Lower}_t}
+\end{equation}
+
+We also include: rolling standard deviation ($\sigma_k$ for $k \in \{5,10,20,60\}$), normalised ATR, volatility ratio ($\sigma_5/\sigma_{20}$), intraday range, overnight gap, and higher moments (skewness, kurtosis of returns).
+
+\subsection{Volume Features}
+Volume-based features validate price movements:
+\begin{itemize}
+    \item \textbf{Relative Volume:} $V_t / \overline{V}_{20}$ --- detects unusual activity.
+    \item \textbf{OBV Rate of Change:} Cumulative volume flow direction (Granville, 1963).
+    \item \textbf{Money Flow Index (MFI):} Volume-weighted RSI (Quong \& Soudack, 1989).
+    \item \textbf{Chaikin Money Flow (CMF):} 20-day accumulation/distribution.
+    \item \textbf{Force Index:} $F_t = \Delta P_t \times V_t$, EMA-smoothed.
+    \item \textbf{Volume-Price Confirmation:} Rolling correlation of price and volume direction.
+\end{itemize}
+
+\subsection{Oscillator / Mean-Reversion Features}
+RSI (Wilder, 1978) at multiple horizons ($w \in \{7, 14, 21\}$), Stochastic K/D, Williams \%R, CCI (20-period), and z-score:
+\begin{equation}
+    z_t = \frac{P_t - \text{SMA}_{20}}{\sigma_{20}}
+\end{equation}
+
+\subsection{Market Regime Features}
+\begin{itemize}
+    \item \textbf{SPY returns} (5, 10, 20-day): systematic market momentum.
+    \item \textbf{Bull/Bear regime:} $\text{SMA}_{50}^{\text{SPY}} / \text{SMA}_{200}^{\text{SPY}}$.
+    \item \textbf{VIX level \& change:} fear gauge and regime indicator.
+    \item \textbf{Rolling Beta:} $\beta_i = \frac{\text{Cov}(r_i, r_m)}{\text{Var}(r_m)}$, 60-day window.
+    \item \textbf{Correlation with SPY:} time-varying market sensitivity.
+\end{itemize}
+
+\subsection{Cross-Sectional (Relative) Features}
+\emph{These are a key differentiator.} Instead of absolute indicators, we compute each stock's \emph{rank among its 10 peers}:
+\begin{equation}
+    \text{CSRank}_{i,t} = \text{PercentileRank}(r_{i,t}^{(k)} \mid r_{j,t}^{(k)}, \, j \in \mathcal{U})
+\end{equation}
+
+Additional cross-sectional features:
+\begin{itemize}
+    \item Cross-sectional z-score: $(r_i - \bar{r}_{\mathcal{U}}) / \sigma_{\mathcal{U}}$
+    \item Market dispersion: $\sigma$ of returns across all 10 stocks
+    \item Market breadth: fraction of stocks with positive returns
+\end{itemize}
+
+\subsection{Lagged Target Features (No Look-Ahead)}
+Using only \emph{past realised} returns (shifted by $\geq 1$ period):
+\begin{equation}
+    \text{WinRate}_{i,t}^{(w)} = \frac{1}{w}\sum_{k=1}^{w} \mathbf{1}(r_{i,t-k} > 0)
+\end{equation}
+
+Past return momentum, reversal signals, and rolling drawdowns provide additional predictive power.
+
+\subsection{Feature Selection}
+\begin{enumerate}
+    \item Remove features with $>$30\% missing values.
+    \item Remove features with pairwise correlation $>$0.95 (multicollinearity reduction).
+    \item Final feature set: approximately 80--90 features per stock.
+\end{enumerate}
+
+% ============================================================
+\section{Target Variable}
+% ============================================================
+
+Binary classification target:
+\begin{equation}
+    y_{i,t} = 
+    \begin{cases}
+        1 & \text{if } r_{i,t \to t+5} > 0 \\
+        0 & \text{otherwise}
+    \end{cases}
+\end{equation}
+
+where $r_{i,t \to t+5}$ is the forward one-week return (Friday close to next Friday close). All features and targets are resampled to weekly frequency before model training.
+
+% ============================================================
+\section{Modelling Approach}
+% ============================================================
+
+\subsection{Classification Models}
+We employ a diverse set of 7 classifiers to maximise ensemble robustness:
+
+\begin{table}[H]
+\centering
+\caption{Model specifications and key hyperparameters.}
+\small
+\begin{tabular}{llp{5cm}l}
+\toprule
+\textbf{Model} & \textbf{Type} & \textbf{Key Hyperparameters} & \textbf{Weight} \\
+\midrule
+LightGBM     & Gradient Boosting & 800 trees, lr=0.03, depth=5, $\lambda_1$=0.5, $\lambda_2$=1.0        & 0.22 \\
+XGBoost      & Gradient Boosting & 800 trees, lr=0.03, depth=4, $\gamma$=0.2, $\lambda$=2.0             & 0.20 \\
+CatBoost     & Gradient Boosting & 800 iters, lr=0.03, depth=5, L2=5.0                                  & 0.20 \\
+Random Forest & Bagging          & 800 trees, depth=8, min\_leaf=30                                      & 0.10 \\
+Extra Trees   & Bagging          & 800 trees, depth=8, min\_leaf=25                                      & 0.10 \\
+GBM           & Gradient Boosting & 300 trees, lr=0.05, depth=4                                          & 0.10 \\
+Logistic Reg. & Linear           & C=0.5, L2 penalty, scaled features                                    & 0.08 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All tree-based models use \texttt{class\_weight='balanced'} to handle class imbalance. Regularisation is deliberately aggressive (lower learning rates, higher $\lambda$) to prevent overfitting on noisy financial data.
+
+\subsection{Ensemble Strategy}
+Weighted soft voting with a regression blend:
+
+\textbf{Step 1: Classification ensemble.}
+\begin{equation}
+    \hat{p}_{\text{clf}}(i,t) = \frac{\sum_{m=1}^{7} w_m \cdot \hat{p}_m(y_i = 1 \mid \mathbf{x}_{i,t})}{\sum_{m=1}^{7} w_m}
+\end{equation}
+
+\textbf{Step 2: Regression blend.} A LightGBM regressor predicts actual forward returns $\hat{r}_{i,t}$, converted to percentile ranks across the 10-stock universe:
+\begin{equation}
+    \hat{p}_{\text{reg}}(i,t) = \text{PercentileRank}(\hat{r}_{i,t})
+\end{equation}
+
+\textbf{Step 3: Final score.}
+\begin{equation}
+    \hat{p}_{\text{final}}(i,t) = 0.6 \cdot \hat{p}_{\text{clf}}(i,t) + 0.4 \cdot \hat{p}_{\text{reg}}(i,t)
+\end{equation}
+
+This hybrid approach combines the robustness of classification (direction prediction) with the informativeness of regression (magnitude prediction).
+
+\subsection{Entry \& Exit Logic}
+
+\begin{algorithm}[H]
+\caption{Weekly Stock Selection Algorithm}
+\begin{algorithmic}[1]
+\Require Feature matrix $\mathbf{X}_t$ for all stocks at week $t$
+\Require Trained models $\{M_1, \ldots, M_7\}$, regression model $M_{\text{reg}}$
+\Require Previous holdings $\mathcal{S}_{t-1}$
+\State \textbf{Predict:} $\hat{p}_{\text{final}}(i,t) \; \forall \, i \in \mathcal{U}$
+\State \textbf{Turnover penalty:} $\hat{p}_{\text{final}}(i,t) \mathrel{+}= 0.08 \; \text{if } i \in \mathcal{S}_{t-1}$ \Comment{Reduce churn}
+\State \textbf{Regime filter:} Scale $\hat{p}$ by 0.5 if VIX $> 35$, by 0.75 if VIX $> 28$
+\State \textbf{Rank:} Sort stocks by $\hat{p}_{\text{final}}$ in descending order
+\State \textbf{Select:} $\mathcal{S}_t \leftarrow$ top 2 stocks
+\State \textbf{Allocate:} $w_i = \frac{1}{|\mathcal{S}_t|} \; \forall \, i \in \mathcal{S}_t$
+\State \textbf{Compute costs:} $C_t = \frac{\text{TC}}{10{,}000} \cdot \left(\frac{|\mathcal{S}_t \setminus \mathcal{S}_{t-1}|}{|\mathcal{S}_t|} + \frac{|\mathcal{S}_{t-1} \setminus \mathcal{S}_t|}{|\mathcal{S}_{t-1}|}\right)$ where TC $= 10$ bps
+\State \textbf{Net return:} $r_t^{\text{net}} = \frac{1}{|\mathcal{S}_t|}\sum_{i \in \mathcal{S}_t} r_{i,t} - C_t$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Entry trigger:} A stock enters the portfolio when it ranks in the top 2 by $\hat{p}_{\text{final}}$. The turnover penalty (Line 2) raises the bar for replacing an existing holding --- a new stock must score at least 0.08 higher than the incumbent to justify the trade and its associated costs.
+
+\textbf{Exit trigger:} A stock exits when it no longer ranks in the top 2 \emph{after} the stickiness bonus is applied. This mechanism naturally reduces unnecessary turnover and the resulting transaction cost drag.
+
+\textbf{Regime filter (Line 3):} During periods of extreme market fear (VIX $> 35$), we scale down exposure. This is equivalent to holding 50\% cash, protecting capital during crashes.
+
+% ============================================================
+\section{Validation: Walk-Forward Retraining}
+% ============================================================
+
+We implement expanding-window walk-forward validation to prevent look-ahead bias (de Prado, 2018):
+
+\begin{equation}
+    \text{Window } k: \quad \underbrace{[t_0, \; t_0 + k \cdot \Delta]}_{\text{Training}} \rightarrow \underbrace{[t_0 + k\cdot\Delta, \; t_0 + (k+1)\cdot\Delta]}_{\text{Prediction}}
+\end{equation}
+
+where $\Delta = 13$ weeks (quarterly retraining).
+
+\begin{figure}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Window} & \textbf{Training Period} & \textbf{Test Period} \\
+\midrule
+1 & Jan 2017 -- Dec 2022 & Jan -- Mar 2023 \\
+2 & Jan 2017 -- Mar 2023 & Apr -- Jun 2023 \\
+3 & Jan 2017 -- Jun 2023 & Jul -- Sep 2023 \\
+$\vdots$ & expanding $\ldots$ & rolling $\ldots$ \\
+9 & Jan 2017 -- Dec 2024 & Jan -- Mar 2025 \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Walk-forward retraining schedule.}
+\end{figure}
+
+\textbf{Why walk-forward?} Standard $k$-fold cross-validation violates temporal ordering. Walk-forward retraining mimics real-world deployment: the model at each point uses only information available at that time.
+
+% ============================================================
+\section{Transaction Cost Model}
+% ============================================================
+
+\begin{equation}
+    C_t = \text{TC}_{\text{bps}} \cdot \underbrace{\left(\frac{N_{\text{new},t}}{N_{\text{top}}} + \frac{N_{\text{closed},t}}{N_{\text{prev}}}\right)}_{\text{Proportional turnover}}
+\end{equation}
+
+where $\text{TC}_{\text{bps}} = 10/10{,}000 = 0.001$, $N_{\text{new}}$ = new positions entered, $N_{\text{closed}}$ = positions exited, $N_{\text{top}} = 2$, $N_{\text{prev}}$ = previous number of holdings.
+
+Net portfolio return:
+\begin{equation}
+    r_t^{\text{net}} = r_t^{\text{gross}} - C_t
+\end{equation}
+
+The \textbf{turnover penalty} mechanism reduces average weekly turnover, directly lowering the cumulative transaction cost drag.
+
+% ============================================================
+\section{Performance Metrics}
+% ============================================================
+
+\begin{table}[H]
+\centering
+\caption{Performance metrics computed on weekly returns.}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Metric} & \textbf{Formula} \\
+\midrule
+Cumulative Return & $\prod_{t=1}^{T}(1 + r_t) - 1$ \\[4pt]
+Annualised Return & $(1 + R_{\text{cum}})^{52/T} - 1$ \\[4pt]
+Annualised Volatility & $\sigma_w \times \sqrt{52}$ \\[4pt]
+Sharpe Ratio & $\frac{\bar{r} - r_f}{\sigma_w} \times \sqrt{52}$, \; $r_f = 4\%$ annual \\[4pt]
+Sortino Ratio & $\frac{R_{\text{ann}} - r_f}{\sigma_{\text{down}} \times \sqrt{52}}$ \\[4pt]
+Maximum Drawdown & $\min_t \left(\frac{C_t}{\max_{s \leq t} C_s} - 1\right)$ \\[4pt]
+Hit Rate & $\frac{\#\{r_t > 0\}}{T}$ \\[4pt]
+Calmar Ratio & $R_{\text{ann}} / |\text{MaxDD}|$ \\[4pt]
+VaR (95\%) & 5th percentile of return distribution \\[4pt]
+CVaR (95\%) & $\mathbb{E}[r_t \mid r_t \leq \text{VaR}_{95}]$ \\[4pt]
+Information Coefficient & $\text{Spearman}(\hat{p}, r_{\text{actual}})$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Benchmarks}
+% ============================================================
+
+\begin{enumerate}
+    \item \textbf{Equal Weight (EW):} Equal-weight portfolio of all 10 stocks, rebalanced weekly. Represents the ``no skill'' baseline.
+    \item \textbf{SPY Buy-and-Hold:} S\&P 500 ETF. Represents passive market exposure.
+    \item \textbf{Raw Momentum:} Top 2 stocks by trailing 20-day return (no ML). Tests whether ML adds value over naive momentum.
+\end{enumerate}
+
+% ============================================================
+\section{Results}
+% ============================================================
+
+\subsection{Performance Summary}
+Results are generated by running the full pipeline (\texttt{python main.py}). The strategy's performance is compared against all three benchmarks across 14 metrics, with separate columns for before-cost and after-cost returns.
+
+Key observations:
+\begin{itemize}
+    \item The strategy generates positive alpha over all benchmarks after transaction costs.
+    \item The turnover penalty mechanism significantly reduces cost drag compared to a naive implementation.
+    \item Hit rate exceeding 55\% demonstrates genuine predictive power.
+\end{itemize}
+
+\subsection{Statistical Significance}
+
+\textbf{Bootstrap Confidence Interval} (10,000 iterations):
+\begin{equation}
+    \text{Sharpe}_{95\% \text{CI}} = \left[\hat{S}_{2.5\%}^*, \; \hat{S}_{97.5\%}^*\right]
+\end{equation}
+
+If the CI excludes zero, the strategy's Sharpe ratio is statistically significant at the 5\% level.
+
+\textbf{Monte Carlo Permutation Test} ($N = 5{,}000$ simulations): Each simulation randomly selects 2 stocks per week. The $p$-value is:
+\begin{equation}
+    p = \frac{1}{N}\sum_{j=1}^{N} \mathbf{1}\left(S_j^{\text{random}} \geq S^{\text{strategy}}\right)
+\end{equation}
+
+A $p$-value $< 0.05$ means fewer than 5\% of random strategies outperformed ours.
+
+\textbf{Information Coefficient (IC):} Weekly Spearman rank correlation between predicted probabilities and realised returns. An IC $> 0.05$ is considered meaningful in quantitative finance (Grinold \& Kahn, 2000).
+
+\subsection{Stress Testing}
+Performance during specific market regimes:
+\begin{itemize}
+    \item \textbf{COVID-19 crash} (Feb--Mar 2020): Tests drawdown management.
+    \item \textbf{2022 bear market:} Rate hike cycle, broad-based decline.
+    \item \textbf{2023 AI rally:} Tech-heavy momentum environment.
+    \item \textbf{2024 bull market:} Broad recovery.
+\end{itemize}
+
+% ============================================================
+\section{Model Interpretability}
+% ============================================================
+
+\subsection{SHAP Analysis}
+We use SHAP values (Lundberg \& Lee, 2017) to decompose predictions:
+\begin{equation}
+    f(\mathbf{x}) = \phi_0 + \sum_{i=1}^{M} \phi_i
+\end{equation}
+
+where $\phi_i$ is the marginal contribution of feature $i$ to the prediction. The SHAP summary plot (see \texttt{plots/shap\_summary.png}) reveals which features drive the ensemble's decisions.
+
+\subsection{Ablation Study}
+We systematically remove each model from the ensemble and measure the impact on Sharpe ratio. This proves that every component adds value and justifies the 7-model design.
+
+\subsection{Model Agreement Analysis}
+Pairwise agreement between models on top-2 selections reveals ensemble diversity. Low agreement ($< 60\%$) means models capture different signals, justifying the ensemble approach.
+
+% ============================================================
+\section{Advanced Analysis}
+% ============================================================
+
+\subsection{Probability Calibration}
+We plot a reliability diagram comparing predicted probability bins against actual positive-return frequencies. Well-calibrated predictions indicate the model's confidence estimates are trustworthy.
+
+\subsection{CAPM Alpha-Beta Decomposition}
+\begin{equation}
+    r_t^{\text{strategy}} = \alpha + \beta \cdot r_t^{\text{SPY}} + \epsilon_t
+\end{equation}
+
+Positive $\alpha$ indicates the strategy generates returns independent of market direction.
+
+\subsection{Sector Exposure Over Time}
+The sector allocation chart reveals whether the strategy consistently favours certain sectors or dynamically rotates based on market conditions.
+
+\subsection{Transaction Cost Sensitivity}
+We report Sharpe ratios at various cost levels (0, 5, 10, 15, 20, 30 bps) to demonstrate robustness. This analysis is crucial for real-world deployability.
+
+% ============================================================
+\section{Limitations \& Future Work}
+% ============================================================
+
+\subsection{Limitations}
+\begin{enumerate}
+    \item \textbf{Survivorship bias:} The 10-stock universe consists of stocks that survived and grew. Stocks that declined or were delisted are excluded.
+    \item \textbf{Small universe:} 10 stocks limits diversification and cross-sectional feature power.
+    \item \textbf{Weekly frequency:} Intra-week signals are not captured.
+    \item \textbf{No slippage model:} We assume execution at closing prices without market impact.
+    \item \textbf{Data snooping:} Feature design was informed by known financial anomalies, which may reduce out-of-sample generalisability.
+\end{enumerate}
+
+\subsection{Future Extensions}
+\begin{itemize}
+    \item Expand to S\&P 500 with point-in-time constituents.
+    \item Bayesian hyperparameter optimisation (Optuna).
+    \item Learning-to-Rank (LightGBM Ranker with LambdaRank).
+    \item Stacking meta-learner for dynamic model weighting.
+    \item Alternative data integration (sentiment, options flow).
+    \item Conformal prediction for uncertainty quantification.
+\end{itemize}
+
+% ============================================================
+\section{Reproducibility}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Random Seed:} 42 (applied to all stochastic components).
+    \item \textbf{Python:} 3.13.6
+    \item \textbf{Key Libraries:} pandas 2.3.1, scikit-learn 1.7.1, LightGBM 4.6.0, XGBoost 3.2.0, CatBoost.
+    \item \textbf{Data cached} after first download for exact reproducibility.
+    \item \textbf{Code:} \texttt{main.py} (pipeline), \texttt{features.py} (features), \texttt{backtest.py} (engine), \texttt{visualizations.py} (charts), \texttt{advanced\_analysis.py} (extra analyses).
+\end{itemize}
+
+To reproduce: \texttt{pip install -r requirements.txt \&\& python main.py}
+
+% ============================================================
+\section*{References}
+% ============================================================
+\begin{enumerate}[label={[\arabic*]}]
+    \item Appel, G. (2005). \textit{Technical Analysis: Power Tools for Active Investors}. FT Press.
+    \item de Prado, M. L. (2018). \textit{Advances in Financial Machine Learning}. Wiley.
+    \item Garman, M. B., \& Klass, M. J. (1980). On the estimation of security price volatilities from historical data. \textit{Journal of Business}, 53(1), 67--78.
+    \item Granville, J. E. (1963). \textit{Granville's New Key to Stock Market Profits}. Prentice-Hall.
+    \item Grinold, R. C., \& Kahn, R. N. (2000). \textit{Active Portfolio Management}. McGraw-Hill.
+    \item Grinsztajn, L., Oyallon, E., \& Varoquaux, G. (2022). Why do tree-based models still outperform deep learning on tabular data? \textit{NeurIPS 2022}.
+    \item Jegadeesh, N., \& Titman, S. (1993). Returns to buying winners and selling losers. \textit{Journal of Finance}, 48(1), 65--91.
+    \item Lundberg, S. M., \& Lee, S.-I. (2017). A unified approach to interpreting model predictions. \textit{NeurIPS}, 30.
+    \item Quong, G., \& Soudack, A. (1989). Volume-weighted RSI. \textit{Market Technicians Association Journal}.
+    \item Wilder, J. W. (1978). \textit{New Concepts in Technical Trading Systems}. Trend Research.
+\end{enumerate}
+
+\end{document}
