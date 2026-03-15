@@ -1,9 +1,10 @@
 """
-MomentumAlpha — ML-Driven Weekly Stock Selector
-QuantQuest Challenge | ESummit'26
+MomentumAlpha - main pipeline
 
-Main execution script: data download → features → models → backtest → analysis
-Run: python main.py
+Downloads stock data, computes features, trains models,
+runs walk-forward backtest, generates visualisations and stats.
+
+Usage: python main.py
 """
 
 import sys

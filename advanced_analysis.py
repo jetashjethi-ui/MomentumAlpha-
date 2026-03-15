@@ -1,7 +1,7 @@
 """
-Advanced Analysis Module for MomentumAlpha Strategy.
-Extra analyses that differentiate from typical AI-generated projects.
-Run: python advanced_analysis.py (after main.py)
+Extra analyses - probability calibration, CAPM decomposition,
+turnover tracking, win/loss streaks, sector exposure, etc.
+Run after main.py has finished.
 """
 
 import pandas as pd

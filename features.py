@@ -1,6 +1,6 @@
 """
-Feature Engineering Module for MomentumAlpha Strategy
-Computes 80+ technical, cross-sectional, and market regime features.
+Feature engineering - computes technical indicators, market regime
+features, and cross-sectional rankings for each stock.
 """
 
 import pandas as pd

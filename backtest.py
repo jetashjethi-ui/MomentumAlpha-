@@ -1,7 +1,6 @@
 """
-Backtesting Engine for MomentumAlpha Strategy — ENHANCED VERSION.
-Walk-forward retraining, portfolio construction, transaction costs, benchmarks.
-Key improvements for higher Sharpe: turnover penalty, regime filter, hybrid scoring.
+Backtesting engine - walk-forward retraining loop, portfolio construction,
+transaction cost modelling, and benchmark comparisons.
 """
 
 import pandas as pd
