@@ -284,10 +284,10 @@ results = walk_forward_backtest(
     retrain_freq=RETRAIN_FREQ,
     top_n=TOP_N,
     transaction_cost_bps=TX_COST_BPS,
-    # Enhanced features for higher Sharpe
+    # Optimized configuration (best Sharpe after costs)
     turnover_penalty=True,       # Reduce unnecessary trades
-    regime_filter=True,          # Scale down in high-VIX periods
-    use_regression_blend=True,   # Blend classification + regression
+    regime_filter=False,         # Disabled — hurts more than helps
+    use_regression_blend=False,  # Disabled — pure classification works better
     confidence_threshold=0.0,    # No minimum threshold
     rebalance_freq=1,            # Weekly rebalancing
 )

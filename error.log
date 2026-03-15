@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "C:\Users\jetas\OneDrive\Desktop\Project3\MomentumAlpha.py", line 381, in <module>
+    plot_returns_distribution(returns_after, bm_ew)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\jetas\OneDrive\Desktop\Project3\visualizations.py", line 133, in plot_returns_distribution
+    if save_path:
+       ^^^^^^^^^
+  File "C:\Users\jetas\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\core\generic.py", line 1577, in __nonzero__
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: The truth value of a Series is ambiguous. Use a.empty, a.bool(), a.item(), a.any() or a.all().
