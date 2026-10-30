@@ -4,6 +4,7 @@ const apiUrl = process.env.MOMENTUM_API_URL?.replace(/\/$/, "")
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  agentRules: false,
   images: {
     unoptimized: true,
   },
