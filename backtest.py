@@ -1,456 +1,815 @@
-"""
-Backtesting engine - walk-forward retraining loop, portfolio construction,
-transaction cost modelling, and benchmark comparisons.
-"""
+"""Leakage-aware walk-forward backtesting and portfolio evaluation."""
 
-import pandas as pd
+from __future__ import annotations
+
+import math
+from typing import Iterable
+
 import numpy as np
-from scipy.stats import spearmanr, ttest_1samp, ttest_ind
+import pandas as pd
+from scipy.stats import spearmanr
+from sklearn.base import clone
 
 
-def walk_forward_backtest(weekly_data, feature_cols, models, tickers,
-                          initial_train_end='2022-12-31',
-                          retrain_freq=13,  # weeks
-                          top_n=2,
-                          transaction_cost_bps=10,
-                          # --- NEW PARAMETERS ---
-                          turnover_penalty=True,
-                          regime_filter=True,
-                          use_regression_blend=True,
-                          confidence_threshold=0.0,
-                          rebalance_freq=1,  # 1=weekly, 2=biweekly
-                          ):
+FEATURE_EXCLUSIONS = {
+    "ticker", "target", "forward_return", "close", "entry_price", "exit_price",
+    "signal_date", "entry_date", "label_end_date",
+}
+
+
+def get_model_weights(model_names: Iterable[str]) -> dict[str, float]:
+    """Return transparent equal weights for the models that fit successfully."""
+    names = list(model_names)
+    if not names:
+        return {}
+    return {name: 1.0 / len(names) for name in names}
+
+
+_get_model_weights = get_model_weights
+
+
+def _training_feature_matrix(
+    train_data: pd.DataFrame,
+    test_data: pd.DataFrame,
+    candidate_features: list[str],
+    *,
+    max_missing_fraction: float = 0.35,
+    max_correlation: float = 0.985,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], pd.Series]:
+    """Fit feature filtering and imputation using training rows only."""
+    candidates = [
+        name for name in candidate_features
+        if name in train_data and name in test_data and name not in FEATURE_EXCLUSIONS
+    ]
+    if not candidates:
+        raise ValueError("No candidate feature columns are available for this fold.")
+
+    train_x = train_data[candidates].apply(pd.to_numeric, errors="coerce")
+    train_x = train_x.replace([np.inf, -np.inf], np.nan)
+    train_x = train_x.loc[:, train_x.isna().mean() <= max_missing_fraction]
+    medians = train_x.median(axis=0).replace([np.inf, -np.inf], np.nan).dropna()
+    train_x = train_x.reindex(columns=medians.index).fillna(medians)
+    train_x = train_x.loc[:, train_x.nunique(dropna=False) > 1]
+    medians = medians.reindex(train_x.columns)
+    if train_x.shape[1] == 0:
+        raise ValueError("Training fold has no finite, varying feature columns.")
+
+    if train_x.shape[1] > 1:
+        correlation = train_x.corr().abs()
+        upper = correlation.where(np.triu(np.ones(correlation.shape, dtype=bool), k=1))
+        redundant = [column for column in upper.columns if upper[column].gt(max_correlation).any()]
+        train_x = train_x.drop(columns=redundant)
+        medians = medians.drop(index=redundant)
+
+    test_x = test_data[train_x.columns].apply(pd.to_numeric, errors="coerce")
+    test_x = test_x.replace([np.inf, -np.inf], np.nan).fillna(medians)
+    return train_x.astype(float), test_x.astype(float), list(train_x.columns), medians
+
+
+def _positive_probability(model, features: pd.DataFrame) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        probabilities = np.asarray(model.predict_proba(features), dtype=float)
+        classes = list(getattr(model, "classes_", []))
+        if probabilities.ndim != 2 or probabilities.shape[0] != len(features):
+            raise ValueError("Model returned an invalid probability matrix.")
+        if 1 not in classes:
+            return np.zeros(len(features), dtype=float)
+        values = probabilities[:, classes.index(1)]
+    elif hasattr(model, "decision_function"):
+        scores = np.asarray(model.decision_function(features), dtype=float).reshape(-1)
+        values = 1.0 / (1.0 + np.exp(-np.clip(scores, -30, 30)))
+    else:
+        values = np.asarray(model.predict(features), dtype=float).reshape(-1)
+    if not np.isfinite(values).all():
+        raise ValueError("Model returned non-finite positive-class scores.")
+    return np.clip(values, 0.0, 1.0)
+
+
+def _portfolio_turnover(previous: dict[str, float], target: dict[str, float]) -> float:
+    names = set(previous) | set(target)
+    return float(sum(abs(target.get(name, 0.0) - previous.get(name, 0.0)) for name in names))
+
+
+def walk_forward_backtest(
+    weekly_data: pd.DataFrame,
+    feature_cols: list[str],
+    models: dict,
+    tickers: list[str],
+    initial_train_end: str = "2022-12-31",
+    retrain_freq: int = 13,
+    top_n: int = 2,
+    transaction_cost_bps: float = 10,
+    turnover_penalty: bool = False,
+    regime_filter: bool = False,
+    use_regression_blend: bool = False,
+    confidence_threshold: float = 0.0,
+    rebalance_freq: int = 1,
+    switch_hurdle: float = 0.08,
+    evaluation_start_date: str | pd.Timestamp | None = None,
+    evaluation_end_date: str | pd.Timestamp | None = None,
+    random_state: int = 42,
+    n_jobs: int = -1,
+    universe_by_week: dict[pd.Timestamp, set[str]] | None = None,
+    min_universe_size: int = 2,
+) -> dict:
+    """Run an expanding-window, next-open execution backtest.
+
+    At each signal date, only labels whose exit date has passed are eligible.
+    Feature filtering, correlation removal, and imputation are fit on each
+    training fold. Returns use the open-to-open intervals generated by features.py.
     """
-    Walk-forward backtesting with periodic retraining.
-    Enhanced with turnover penalty, regime filter, and regression blend.
-    """
-    tc = transaction_cost_bps / 10000
+    if weekly_data.empty:
+        raise ValueError("weekly_data is empty.")
+    required = {
+        "ticker", "target", "forward_return", "signal_date", "entry_date", "label_end_date"
+    }
+    missing = required - set(weekly_data.columns)
+    if missing:
+        raise ValueError(f"weekly_data is missing required columns: {', '.join(sorted(missing))}")
+    if not tickers or len(set(tickers)) != len(tickers) or not 1 <= top_n <= len(tickers):
+        raise ValueError("top_n must be between 1 and the number of tickers.")
+    if min_universe_size < top_n:
+        raise ValueError("min_universe_size must be at least top_n.")
+    if retrain_freq < 1 or rebalance_freq < 1:
+        raise ValueError("retrain_freq and rebalance_freq must be positive integers.")
+    if (
+        not np.isfinite(transaction_cost_bps)
+        or transaction_cost_bps < 0
+        or not np.isfinite(confidence_threshold)
+        or not 0 <= confidence_threshold <= 1
+    ):
+        raise ValueError("Transaction costs must be non-negative and confidence threshold must be in [0, 1].")
 
-    # Get unique weeks
-    all_weeks = weekly_data.index.unique().sort_values()
-    train_end = pd.Timestamp(initial_train_end)
-    test_weeks = all_weeks[all_weeks > train_end]
+    data = weekly_data.sort_index().copy()
+    data.index = pd.to_datetime(data.index)
+    for name in ("signal_date", "entry_date", "label_end_date"):
+        data[name] = pd.to_datetime(data[name])
+    data["target"] = pd.to_numeric(data["target"], errors="coerce")
+    data["forward_return"] = pd.to_numeric(data["forward_return"], errors="coerce")
+    data = data.replace([np.inf, -np.inf], np.nan)
 
+    initial_cutoff = pd.Timestamp(initial_train_end)
+    test_weeks = data.index.unique().sort_values()
+    test_weeks = test_weeks[test_weeks > initial_cutoff]
+    if evaluation_start_date is not None:
+        test_weeks = test_weeks[test_weeks >= pd.Timestamp(evaluation_start_date)]
+    if evaluation_end_date is not None:
+        test_weeks = test_weeks[test_weeks < pd.Timestamp(evaluation_end_date)]
     if len(test_weeks) == 0:
-        raise ValueError("No test weeks found after initial_train_end")
+        raise ValueError("No test weeks are available after initial_train_end.")
 
-    predictions_list = []
-    portfolio_returns_before = []
-    portfolio_returns_after = []
-    selected_stocks_history = []
-    model_importances = {}
+    cost_rate = transaction_cost_bps / 10_000.0
+    predictions: list[pd.DataFrame] = []
+    portfolio_records: list[dict] = []
+    selected_history: list[dict] = []
+    model_importances: dict[pd.Timestamp, dict] = {}
+    fit_records: list[dict] = []
+    skipped_weeks: dict[str, int] = {}
+    trained_models: dict = {}
+    trained_calibrators: dict = {}
+    trained_regression = None
+    fitted_features: list[str] = []
+    fitted_medians = pd.Series(dtype=float)
+    previous_weights: dict[str, float] = {}
+    previous_selected: set[str] = set()
     weeks_since_retrain = 0
-    trained_models = {}
-    regression_models = {}
+    last_models: dict = {}
 
-    prev_selected = set()
-    prev_probs = {}  # Store previous probabilities for turnover penalty
+    for week_number, week in enumerate(test_weeks):
+        week_data = data.loc[data.index == week].copy()
+        week_data = week_data.loc[week_data["ticker"].isin(tickers)].sort_values("ticker")
+        expected_tickers = (
+            set(universe_by_week.get(pd.Timestamp(week), set()))
+            if universe_by_week is not None else set(tickers)
+        )
+        if len(expected_tickers) < min_universe_size or set(week_data["ticker"].astype(str)) != expected_tickers:
+            skipped_weeks["incomplete_universe"] = skipped_weeks.get("incomplete_universe", 0) + 1
+            continue
+        # Unfinished future labels are neither training examples nor scored returns.
+        if week_data["forward_return"].isna().any() or week_data["target"].isna().any():
+            skipped_weeks["unfinished_forward_labels"] = skipped_weeks.get("unfinished_forward_labels", 0) + 1
+            continue
+        timing_columns = ("signal_date", "entry_date", "label_end_date")
+        if any(week_data[name].isna().any() or week_data[name].nunique() != 1 for name in timing_columns):
+            skipped_weeks["misaligned_execution_dates"] = skipped_weeks.get("misaligned_execution_dates", 0) + 1
+            continue
+        decision_date = week_data["signal_date"].iloc[0]
+        if pd.isna(decision_date):
+            skipped_weeks["missing_signal_date"] = skipped_weeks.get("missing_signal_date", 0) + 1
+            continue
 
-    for i, week in enumerate(test_weeks):
-        # Check if we need to retrain
-        if i == 0 or weeks_since_retrain >= retrain_freq:
-            # Training data: all data up to this week
-            train_mask = weekly_data.index <= week - pd.Timedelta(days=1)
-            train_data = weekly_data[train_mask].dropna(subset=feature_cols + ['target'])
-
-            X_train = train_data[feature_cols].fillna(0)
-            y_train = train_data['target']
-            y_train_reg = train_data['forward_return']  # For regression
-
-            # Train all classification models
+        prior_labeled = data.loc[
+            (data.index < week)
+            & data["label_end_date"].notna()
+            & data["target"].notna()
+            & data["forward_return"].notna()
+        ]
+        eligible_train = prior_labeled.loc[prior_labeled["label_end_date"] <= decision_date]
+        purged_rows = int(len(prior_labeled) - len(eligible_train))
+        if not eligible_train.empty and (eligible_train["label_end_date"] > decision_date).any():
+            raise RuntimeError("Training-set purge invariant failed: a label extends past the signal date.")
+        should_retrain = not trained_models or weeks_since_retrain >= retrain_freq
+        if should_retrain:
+            training_weeks = eligible_train.index.unique().sort_values()
+            calibration_week_count = max(13, int(math.ceil(len(training_weeks) * 0.20)))
+            if len(training_weeks) - calibration_week_count < 52:
+                raise ValueError(
+                    f"Only {len(training_weeks)} fully realized weeks are available before {decision_date.date()}; "
+                    "at least 52 model-fit weeks plus 13 later calibration weeks are required."
+                )
+            calibration_start = training_weeks[-calibration_week_count]
+            model_fit_data = eligible_train.loc[eligible_train.index < calibration_start]
+            calibration_data = eligible_train.loc[eligible_train.index >= calibration_start]
+            if model_fit_data["target"].nunique() < 2:
+                raise ValueError(f"Training labels before {decision_date.date()} contain fewer than two classes.")
+            y_calibration = calibration_data["target"].astype(int)
+            calibration_rows = pd.concat([calibration_data, week_data], axis=0)
+            x_train, x_calibration_and_week, fitted_features, fitted_medians = _training_feature_matrix(
+                model_fit_data, calibration_rows, feature_cols
+            )
+            x_calibration = x_calibration_and_week.iloc[:len(calibration_data)]
+            x_week = x_calibration_and_week.iloc[len(calibration_data):]
+            y_train = model_fit_data["target"].astype(int)
             trained_models = {}
-            for name, model in models.items():
+            trained_calibrators = {}
+            failures: list[str] = []
+            calibration_failures: list[str] = []
+            model_importances[week] = {}
+            for name, estimator in models.items():
                 try:
-                    model.fit(X_train, y_train)
-                    trained_models[name] = model
+                    fitted = clone(estimator)
+                    fitted.fit(x_train, y_train)
+                    trained_models[name] = fitted
+                    calibrator = None
+                    if y_calibration.nunique() == 2:
+                        try:
+                            from sklearn.linear_model import LogisticRegression
 
-                    # Store feature importances if available
-                    if hasattr(model, 'feature_importances_'):
-                        if week not in model_importances:
-                            model_importances[week] = {}
+                            raw_calibration = _positive_probability(fitted, x_calibration)
+                            calibration_logits = np.log(
+                                np.clip(raw_calibration, 1e-6, 1 - 1e-6)
+                                / (1 - np.clip(raw_calibration, 1e-6, 1 - 1e-6))
+                            ).reshape(-1, 1)
+                            calibrator = LogisticRegression(C=1.0, max_iter=1_000)
+                            calibrator.fit(calibration_logits, y_calibration)
+                        except Exception as exc:
+                            calibration_failures.append(f"{name}: {exc}")
+                    else:
+                        calibration_failures.append(f"{name}: calibration block contains one class")
+                    trained_calibrators[name] = calibrator
+                    importance_owner = fitted
+                    if hasattr(fitted, "named_steps"):
+                        importance_owner = fitted.named_steps.get("model", fitted)
+                    if hasattr(importance_owner, "feature_importances_"):
                         model_importances[week][name] = dict(
-                            zip(feature_cols, model.feature_importances_)
+                            zip(fitted_features, importance_owner.feature_importances_)
                         )
-                except Exception as e:
-                    print(f"  Warning: {name} training failed: {e}")
+                    elif hasattr(importance_owner, "coef_"):
+                        coefficients = np.asarray(importance_owner.coef_, dtype=float)
+                        importance = np.mean(np.abs(coefficients), axis=0)
+                        model_importances[week][name] = dict(zip(fitted_features, importance))
+                except Exception as exc:
+                    failures.append(f"{name}: {exc}")
+            if not trained_models:
+                details = "; ".join(failures) or "no models were provided"
+                raise RuntimeError(f"Every model failed to fit before {week.date()}: {details}")
 
-            # Train regression models for return prediction (blend)
+            trained_regression = None
             if use_regression_blend:
-                from sklearn.ensemble import GradientBoostingRegressor
-                from lightgbm import LGBMRegressor
-
-                regression_models = {}
                 try:
-                    reg_lgbm = LGBMRegressor(
-                        n_estimators=300, learning_rate=0.05, max_depth=5,
-                        subsample=0.8, colsample_bytree=0.8,
-                        verbose=-1, random_state=42, n_jobs=-1
-                    )
-                    # Cap extreme returns to reduce noise
-                    y_reg_capped = y_train_reg.clip(
-                        y_train_reg.quantile(0.02), y_train_reg.quantile(0.98)
-                    )
-                    reg_lgbm.fit(X_train, y_reg_capped)
-                    regression_models['LGBMReg'] = reg_lgbm
-                except:
-                    pass
+                    from lightgbm import LGBMRegressor
 
+                    regressor = LGBMRegressor(
+                        n_estimators=300, learning_rate=0.03, max_depth=4,
+                        num_leaves=15, reg_lambda=2.0, random_state=random_state,
+                        n_jobs=n_jobs, verbosity=-1,
+                    )
+                    target_returns = model_fit_data["forward_return"]
+                    clipped_target = target_returns.clip(
+                        target_returns.quantile(0.02), target_returns.quantile(0.98)
+                    )
+                    regressor.fit(x_train, clipped_target)
+                    trained_regression = regressor
+                except Exception as exc:
+                    print(f"Regression blend skipped at {week.date()}: {exc}")
+
+            fit_records.append({
+                "week": week,
+                "signal_date": decision_date,
+                "training_rows": int(len(model_fit_data)),
+                "training_weeks": int(model_fit_data.index.nunique()),
+                "eligible_labeled_rows": int(len(eligible_train)),
+                "purged_unrealized_rows": purged_rows,
+                "calibration_rows": int(len(calibration_data)),
+                "calibration_weeks": int(calibration_data.index.nunique()),
+                "calibration_start": calibration_data.index.min(),
+                "calibration_label_end": calibration_data["label_end_date"].max(),
+                "training_label_end": eligible_train["label_end_date"].max(),
+                "feature_count": len(fitted_features),
+                "models": list(trained_models),
+                "failures": failures,
+                "calibration_failures": calibration_failures,
+            })
             weeks_since_retrain = 0
+            last_models = trained_models
 
         weeks_since_retrain += 1
+        if not should_retrain:
+            x_week = week_data[fitted_features].apply(pd.to_numeric, errors="coerce")
+            x_week = x_week.replace([np.inf, -np.inf], np.nan).fillna(fitted_medians)
 
-        # Skip non-rebalance weeks
-        if rebalance_freq > 1 and i % rebalance_freq != 0:
-            # Hold previous positions
-            if selected_stocks_history:
-                last_stocks = selected_stocks_history[-1]['stocks']
-                week_data = weekly_data[weekly_data.index == week]
-                if len(week_data) >= len(tickers):
-                    held = week_data[week_data['ticker'].isin(last_stocks)]
-                    if len(held) > 0:
-                        port_ret = held['forward_return'].mean()
-                        portfolio_returns_before.append({'week': week, 'return': port_ret})
-                        portfolio_returns_after.append({
-                            'week': week, 'return': port_ret,  # No costs on hold
-                            'turnover': 0, 'n_new': 0, 'n_closed': 0
-                        })
-                        selected_stocks_history.append({
-                            'week': week, 'stocks': last_stocks
-                        })
-            continue
-
-        # Get this week's data for all stocks
-        week_data = weekly_data[weekly_data.index == week]
-
-        if len(week_data) < len(tickers):
-            continue
-
-        X_test = week_data[feature_cols].fillna(0)
-
-        # === MARKET REGIME FILTER ===
-        regime_scale = 1.0
-        if regime_filter and 'vix_level' in feature_cols:
-            avg_vix = week_data['vix_level'].mean()
-            # If VIX is extremely high (>35), reduce conviction
-            if avg_vix > 35:
-                regime_scale = 0.5  # Half conviction in extreme fear
-            elif avg_vix > 28:
-                regime_scale = 0.75
-
-        # Get predictions from all classification models
-        model_probs = {}
-        for name, model in trained_models.items():
+        model_probabilities: dict[str, np.ndarray] = {}
+        raw_model_probabilities: dict[str, np.ndarray] = {}
+        prediction_failures: list[str] = []
+        for name, fitted in trained_models.items():
             try:
-                if hasattr(model, 'predict_proba'):
-                    probs = model.predict_proba(X_test)[:, 1]
-                else:
-                    probs = model.predict(X_test)
-                model_probs[name] = probs
-            except:
-                pass
+                raw_probability = _positive_probability(fitted, x_week)
+                raw_model_probabilities[name] = raw_probability
+                calibrator = trained_calibrators.get(name)
+                if calibrator is not None:
+                    logits = np.log(
+                        np.clip(raw_probability, 1e-6, 1 - 1e-6)
+                        / (1 - np.clip(raw_probability, 1e-6, 1 - 1e-6))
+                    ).reshape(-1, 1)
+                    raw_probability = calibrator.predict_proba(logits)[:, 1]
+                model_probabilities[name] = raw_probability
+            except Exception as exc:
+                prediction_failures.append(f"{name}: {exc}")
+        if not model_probabilities:
+            raise RuntimeError(f"All models failed to predict for {week.date()}.")
 
-        if not model_probs:
-            continue
+        weights = get_model_weights(model_probabilities)
+        classifier_score = sum(
+            weights[name] * probabilities for name, probabilities in model_probabilities.items()
+        )
+        classifier_score = np.clip(classifier_score, 0.0, 1.0)
+        raw_classifier_score = np.mean(
+            [raw_model_probabilities[name] for name in model_probabilities], axis=0
+        )
+        rank_score = classifier_score.copy()
+        if trained_regression is not None:
+            try:
+                regression_prediction = trained_regression.predict(x_week)
+                regression_rank = pd.Series(regression_prediction).rank(pct=True, method="average").to_numpy()
+                rank_score = 0.6 * classifier_score + 0.4 * regression_rank
+            except Exception as exc:
+                print(f"Regression predictions skipped at {week.date()}: {exc}")
 
-        # Classification ensemble
-        weights = _get_model_weights(list(model_probs.keys()))
-        clf_prob = np.zeros(len(X_test))
-        total_weight = 0
-        for name, probs in model_probs.items():
-            w = weights.get(name, 1.0)
-            clf_prob += w * probs
-            total_weight += w
-        clf_prob /= total_weight
+        # Hysteresis affects selection only; reported probabilities stay intact.
+        decision_score = rank_score.copy()
+        if turnover_penalty and previous_selected:
+            for position, ticker in enumerate(week_data["ticker"].astype(str)):
+                if ticker in previous_selected:
+                    decision_score[position] += switch_hurdle
 
-        # === REGRESSION BLEND ===
-        if use_regression_blend and regression_models:
-            reg_preds = np.zeros(len(X_test))
-            n_reg = 0
-            for name, reg_model in regression_models.items():
-                try:
-                    reg_preds += reg_model.predict(X_test)
-                    n_reg += 1
-                except:
-                    pass
-
-            if n_reg > 0:
-                reg_preds /= n_reg
-                # Convert regression predictions to rank scores (0-1)
-                reg_rank = pd.Series(reg_preds).rank(pct=True).values
-
-                # Blend: 60% classification + 40% regression rank
-                ensemble_prob = 0.6 * clf_prob + 0.4 * reg_rank
-            else:
-                ensemble_prob = clf_prob
-        else:
-            ensemble_prob = clf_prob
-
-        # === TURNOVER PENALTY ===
-        if turnover_penalty and prev_probs:
-            week_tickers_list = list(week_data['ticker'].values)
-            for j, ticker in enumerate(week_tickers_list):
-                if ticker in prev_selected:
-                    # Strong stickiness bonus — only switch if replacement is much better
-                    # This dramatically reduces turnover and transaction costs
-                    ensemble_prob[j] += 0.08
-
-        # Create prediction record
-        week_tickers = week_data['ticker'].values
-        week_returns = week_data['forward_return'].values
-
-        pred_df = pd.DataFrame({
-            'week': week,
-            'ticker': week_tickers,
-            'ensemble_prob': ensemble_prob,
-            'actual_return': week_returns,
-            'target': week_data['target'].values,
-        })
-
-        # Add individual model probabilities
-        for name, probs in model_probs.items():
-            pred_df[f'prob_{name}'] = probs
-
-        # Rank and select top N
-        pred_df['rank'] = pred_df['ensemble_prob'].rank(ascending=False).astype(int)
-
-        # === CONFIDENCE THRESHOLD ===
+        ticker_names = week_data["ticker"].astype(str).to_numpy()
+        stable_order = np.lexsort((ticker_names, -decision_score))
+        selected_flags = np.zeros(len(week_data), dtype=int)
         if confidence_threshold > 0:
-            # Only select if probability exceeds threshold
-            eligible = pred_df[pred_df['ensemble_prob'] >= confidence_threshold]
-            if len(eligible) >= top_n:
-                pred_df['selected'] = ((pred_df['rank'] <= top_n) &
-                                       (pred_df['ensemble_prob'] >= confidence_threshold)).astype(int)
-            else:
-                pred_df['selected'] = (pred_df['rank'] <= top_n).astype(int)
+            eligible = decision_score >= confidence_threshold
+            eligible_order = stable_order[eligible[stable_order]]
+            if len(eligible_order):
+                selected_flags[eligible_order[:top_n]] = 1
         else:
-            pred_df['selected'] = (pred_df['rank'] <= top_n).astype(int)
+            selected_flags[stable_order[:top_n]] = 1
+        selected_indices = np.flatnonzero(selected_flags)
 
-        n_selected = pred_df['selected'].sum()
-        pred_df['weight'] = pred_df['selected'] / max(n_selected, 1)
+        selected_tickers = ticker_names[selected_indices]
+        target_weights = {ticker: 1.0 / len(selected_tickers) for ticker in selected_tickers}
+        exposure_scale = 1.0
+        if regime_filter and "vix_level" in week_data:
+            mean_vix = pd.to_numeric(week_data["vix_level"], errors="coerce").mean()
+            if pd.notna(mean_vix) and mean_vix > 35:
+                exposure_scale = 0.5
+            elif pd.notna(mean_vix) and mean_vix > 28:
+                exposure_scale = 0.75
+        target_weights = {ticker: weight * exposure_scale for ticker, weight in target_weights.items()}
 
-        predictions_list.append(pred_df)
+        do_rebalance = week_number % rebalance_freq == 0 or not previous_weights
+        if do_rebalance:
+            active_weights = target_weights
+            traded_notional = _portfolio_turnover(previous_weights, active_weights)
+            transaction_cost = cost_rate * traded_notional
+            displayed_selected = set(selected_tickers)
+        else:
+            active_weights = previous_weights.copy()
+            traded_notional = 0.0
+            transaction_cost = 0.0
+            displayed_selected = set(previous_weights)
 
-        # Portfolio return (before costs)
-        selected = pred_df[pred_df['selected'] == 1]
-        port_ret_before = selected['actual_return'].mean()
+        actual_returns = dict(zip(ticker_names, week_data["forward_return"].astype(float)))
+        gross_return = sum(weight * actual_returns.get(ticker, 0.0) for ticker, weight in active_weights.items())
+        net_return = (1.0 + gross_return) * (1.0 - transaction_cost) - 1.0
 
-        # Apply regime scaling (reduce exposure in high-vol regimes)
-        if regime_scale < 1.0:
-            # Partial investment: rest in "cash" (0% return)
-            port_ret_before = port_ret_before * regime_scale
+        ending_value = 1.0 + gross_return
+        if ending_value > 0:
+            previous_weights = {
+                ticker: weight * (1.0 + actual_returns.get(ticker, 0.0)) / ending_value
+                for ticker, weight in active_weights.items() if weight > 0
+            }
+        else:
+            previous_weights = {}
+        previous_selected = set(displayed_selected)
 
-        portfolio_returns_before.append({'week': week, 'return': port_ret_before})
-
-        # Transaction costs
-        current_selected = set(selected['ticker'].values)
-        new_positions = current_selected - prev_selected
-        closed_positions = prev_selected - current_selected
-
-        # Cost = entry cost for new + exit cost for closed
-        entry_cost = tc * len(new_positions) / max(n_selected, 1)
-        exit_cost = tc * len(closed_positions) / max(len(prev_selected), 1)
-        total_cost = entry_cost + exit_cost
-
-        port_ret_after = port_ret_before - total_cost
-        portfolio_returns_after.append({
-            'week': week,
-            'return': port_ret_after,
-            'turnover': (len(new_positions) + len(closed_positions)) / (2 * max(n_selected, 1)),
-            'n_new': len(new_positions),
-            'n_closed': len(closed_positions)
+        prediction_frame = pd.DataFrame({
+            "week": week,
+            "signal_date": decision_date,
+            "entry_date": week_data["entry_date"].to_numpy(),
+            "label_end_date": week_data["label_end_date"].to_numpy(),
+            "ticker": ticker_names,
+            "ensemble_prob": classifier_score,
+            "ensemble_prob_raw": raw_classifier_score,
+            "rank_score": rank_score,
+            "decision_score": decision_score,
+            "actual_return": week_data["forward_return"].to_numpy(dtype=float),
+            "target": week_data["target"].to_numpy(dtype=float),
+            "rank": pd.Series(-decision_score).rank(method="first").astype(int).to_numpy(),
+            "selected": np.isin(ticker_names, list(displayed_selected)).astype(int),
+            "weight": [active_weights.get(ticker, 0.0) for ticker in ticker_names],
+            "rebalance": bool(do_rebalance),
+            "exposure": float(sum(active_weights.values())),
         })
+        for name, probabilities in model_probabilities.items():
+            prediction_frame[f"prob_{name}"] = probabilities
+            prediction_frame[f"prob_raw_{name}"] = raw_model_probabilities[name]
+        if prediction_failures:
+            prediction_frame["prediction_warnings"] = "; ".join(prediction_failures)
+        predictions.append(prediction_frame)
 
-        selected_stocks_history.append({
-            'week': week,
-            'stocks': list(current_selected)
+        portfolio_records.append({
+            "week": week,
+            "signal_date": decision_date,
+            "entry_date": week_data["entry_date"].dropna().min(),
+            "label_end_date": week_data["label_end_date"].dropna().min(),
+            "gross_return": gross_return,
+            "transaction_cost": transaction_cost,
+            "net_return": net_return,
+            "turnover": 0.5 * traded_notional,
+            "traded_notional": traded_notional,
+            "exposure": float(sum(active_weights.values())),
+            "rebalance": bool(do_rebalance),
         })
+        selected_history.append({"week": week, "stocks": sorted(displayed_selected)})
 
-        # Store for next iteration
-        prev_selected = current_selected
-        prev_probs = dict(zip(week_tickers, ensemble_prob))
+    if not predictions:
+        raise RuntimeError("No complete-universe out-of-sample predictions were produced.")
+    prediction_frame = pd.concat(predictions, ignore_index=True)
+    portfolio = pd.DataFrame(portfolio_records).set_index("week").sort_index()
+    return {
+        "predictions": prediction_frame,
+        "returns_before_costs": portfolio["gross_return"],
+        "returns_after_costs": portfolio["net_return"],
+        "turnover": portfolio["turnover"],
+        "portfolio": portfolio,
+        "selected_stocks": selected_history,
+        "model_importances": model_importances,
+        "fit_records": fit_records,
+        "test_weeks": test_weeks,
+        "last_models": last_models,
+        "last_calibrators": trained_calibrators,
+        "last_feature_cols": fitted_features,
+        "last_feature_medians": fitted_medians,
+        "skipped_weeks": skipped_weeks,
+    }
 
-    # Combine results
-    predictions = pd.concat(predictions_list, ignore_index=True)
-    ret_before = pd.DataFrame(portfolio_returns_before).set_index('week')['return']
-    ret_after = pd.DataFrame(portfolio_returns_after).set_index('week')
+
+def _apply_weight_path(
+    weekly_data: pd.DataFrame,
+    target_weights: dict[pd.Timestamp, dict[str, float]],
+    transaction_cost_bps: float,
+) -> tuple[pd.Series, pd.Series]:
+    returns = weekly_data.pivot_table(
+        values="forward_return", index=weekly_data.index, columns="ticker", aggfunc="first"
+    ).sort_index()
+    cost_rate = transaction_cost_bps / 10_000.0
+    previous: dict[str, float] = {}
+    gross_values: dict[pd.Timestamp, float] = {}
+    net_values: dict[pd.Timestamp, float] = {}
+    for week, row in returns.iterrows():
+        target = target_weights.get(week, {})
+        missing_returns = [
+            ticker for ticker in target
+            if ticker not in row.index or not np.isfinite(pd.to_numeric(row.get(ticker), errors="coerce"))
+        ]
+        if missing_returns:
+            raise ValueError(
+                f"Benchmark portfolio has missing returns for {missing_returns} in signal week {week.date()}."
+            )
+        traded = _portfolio_turnover(previous, target)
+        cost = cost_rate * traded
+        gross = sum(weight * float(row.get(ticker, 0.0)) for ticker, weight in target.items())
+        gross_values[week] = gross
+        net_values[week] = (1.0 + gross) * (1.0 - cost) - 1.0
+        ending_value = 1.0 + gross
+        if ending_value > 0:
+            previous = {
+                ticker: weight * (1.0 + float(row.get(ticker, 0.0))) / ending_value
+                for ticker, weight in target.items() if weight > 0
+            }
+        else:
+            previous = {}
+    return pd.Series(gross_values, dtype=float), pd.Series(net_values, dtype=float)
+
+
+def compute_benchmark_returns(
+    weekly_data: pd.DataFrame,
+    tickers: list[str],
+    spy_data: pd.DataFrame,
+    *,
+    top_n: int = 2,
+    transaction_cost_bps: float = 10,
+    evaluation_weeks: Iterable[pd.Timestamp] | None = None,
+    spy_dividends: pd.Series | None = None,
+) -> dict[str, pd.Series]:
+    """Compute matched-period SPY, equal-weight, and raw-momentum baselines."""
+    if weekly_data.empty:
+        raise ValueError("weekly_data is empty.")
+    if evaluation_weeks is not None:
+        evaluation_weeks = pd.DatetimeIndex(evaluation_weeks)
+        weekly_data = weekly_data.loc[weekly_data.index.isin(evaluation_weeks)]
+        if weekly_data.empty:
+            raise ValueError("No weekly rows match the requested evaluation period.")
+    returns = weekly_data.pivot_table(
+        values="forward_return", index=weekly_data.index, columns="ticker", aggfunc="first"
+    ).sort_index()
+    available_tickers = [ticker for ticker in tickers if ticker in returns.columns]
+    if not available_tickers:
+        raise ValueError("No requested benchmark stocks are present in weekly_data.")
+
+    equal_weights: dict[pd.Timestamp, dict[str, float]] = {}
+    momentum_weights: dict[pd.Timestamp, dict[str, float]] = {}
+    for week in returns.index:
+        week_rows = weekly_data.loc[weekly_data.index == week]
+        week_rows = week_rows.loc[week_rows["ticker"].isin(available_tickers)].dropna(subset=["forward_return"])
+        names = week_rows["ticker"].astype(str).tolist()
+        if not names:
+            continue
+        equal_weights[week] = {name: 1.0 / len(names) for name in names}
+        if "return_20d" in week_rows:
+            selected = week_rows.nlargest(min(top_n, len(week_rows)), "return_20d")["ticker"].astype(str)
+            momentum_weights[week] = {name: 1.0 / len(selected) for name in selected}
+
+    equal_gross, equal_net = _apply_weight_path(weekly_data, equal_weights, transaction_cost_bps)
+    momentum_gross, momentum_net = _apply_weight_path(weekly_data, momentum_weights, transaction_cost_bps)
+
+    spy = spy_data.copy()
+    if "Open" not in spy:
+        raise ValueError("SPY data must include Open prices for matched execution timing.")
+    spy_open = pd.to_numeric(spy["Open"], errors="coerce").dropna().sort_index()
+    weekly_spy_open = spy_open.resample("W-FRI").first()
+    spy_entry = weekly_spy_open.shift(-1)
+    spy_exit = weekly_spy_open.shift(-2)
+    spy_cash = pd.Series(0.0, index=weekly_spy_open.index)
+    if spy_dividends is not None and not spy_dividends.empty:
+        event_dates = pd.DatetimeIndex(spy_dividends.index).tz_localize(None).normalize().to_numpy(dtype="datetime64[ns]")
+        event_amounts = pd.to_numeric(spy_dividends, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        cumulative = np.concatenate(([0.0], np.cumsum(event_amounts)))
+        valid = spy_entry.notna() & spy_exit.notna()
+        if valid.any():
+            entries = pd.DatetimeIndex(spy_entry.loc[valid].index).tz_localize(None).normalize().to_numpy(dtype="datetime64[ns]")
+            exits = pd.DatetimeIndex(spy_exit.loc[valid].index).tz_localize(None).normalize().to_numpy(dtype="datetime64[ns]")
+            first = np.searchsorted(event_dates, entries, side="right")
+            last = np.searchsorted(event_dates, exits, side="right")
+            spy_cash.loc[valid] = cumulative[last] - cumulative[first]
+    spy_forward = ((spy_exit + spy_cash) / spy_entry - 1.0).reindex(returns.index).dropna()
+    if not spy_forward.empty:
+        spy_net = spy_forward.copy()
+        spy_net.iloc[0] = (1.0 + spy_net.iloc[0]) * (1.0 - transaction_cost_bps / 10_000.0) - 1.0
+    else:
+        spy_net = spy_forward
 
     return {
-        'predictions': predictions,
-        'returns_before_costs': ret_before,
-        'returns_after_costs': ret_after['return'],
-        'turnover': ret_after['turnover'],
-        'selected_stocks': selected_stocks_history,
-        'model_importances': model_importances,
-        'test_weeks': test_weeks,
+        "equal_weight": equal_net,
+        "equal_weight_gross": equal_gross,
+        "spy": spy_net,
+        "spy_gross": spy_forward,
+        "raw_momentum": momentum_net,
+        "raw_momentum_gross": momentum_gross,
     }
 
 
-def _get_model_weights(model_names):
-    """Default ensemble weights — boosted models get more weight."""
-    default_weights = {
-        'LightGBM': 0.22,
-        'XGBoost': 0.20,
-        'CatBoost': 0.20,
-        'RandomForest': 0.10,
-        'ExtraTrees': 0.10,
-        'GBM': 0.10,
-        'LogisticRegression': 0.08,
-    }
-    weights = {}
-    for name in model_names:
-        weights[name] = default_weights.get(name, 0.10)
-    return weights
-
-
-def compute_benchmark_returns(weekly_data, tickers, spy_data):
-    """Compute benchmark portfolio returns."""
-    benchmarks = {}
-
-    # 1. Equal-weight all 10 stocks
-    all_weeks = weekly_data.index.unique().sort_values()
-    ew_returns = []
-    for week in all_weeks:
-        week_data = weekly_data[weekly_data.index == week]
-        if len(week_data) >= len(tickers):
-            ew_ret = week_data['forward_return'].mean()
-            ew_returns.append({'week': week, 'return': ew_ret})
-    benchmarks['equal_weight'] = pd.DataFrame(ew_returns).set_index('week')['return']
-
-    # 2. SPY buy-and-hold
-    spy_weekly = spy_data['Close'].resample('W-FRI').last()
-    spy_ret = spy_weekly.pct_change().shift(-1).dropna()
-    benchmarks['spy'] = spy_ret
-
-    # 3. Raw momentum baseline (top 2 by past 4-week return, no ML)
-    mom_returns = []
-    for week in all_weeks:
-        week_data = weekly_data[weekly_data.index == week]
-        if len(week_data) >= len(tickers) and 'return_20d' in week_data.columns:
-            top2 = week_data.nlargest(2, 'return_20d')
-            mom_ret = top2['forward_return'].mean()
-            mom_returns.append({'week': week, 'return': mom_ret})
-    benchmarks['raw_momentum'] = pd.DataFrame(mom_returns).set_index('week')['return']
-
-    return benchmarks
-
-
-def compute_metrics(returns, risk_free_rate=0.04, periods_per_year=52):
-    """Compute comprehensive performance metrics."""
-    returns = returns.dropna()
-    n_periods = len(returns)
+def compute_metrics(
+    returns: pd.Series,
+    risk_free_rate: float = 0.04,
+    periods_per_year: int = 52,
+) -> dict[str, float | int]:
+    """Calculate annualized, risk-adjusted, drawdown, and tail-risk metrics."""
+    values = pd.to_numeric(pd.Series(returns), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    n_periods = len(values)
     if n_periods == 0:
         return {}
+    if periods_per_year <= 0 or not np.isfinite(risk_free_rate) or risk_free_rate <= -1:
+        raise ValueError("periods_per_year must be positive and risk_free_rate must exceed -100%.")
+    if (values < -1).any():
+        raise ValueError("Simple returns cannot be below -100%.")
 
-    # Cumulative return
-    cum_return = (1 + returns).prod() - 1
-
-    # Annualized return
+    values_array = values.to_numpy(dtype=float)
+    growth = np.cumprod(1.0 + values_array)
+    total_growth = float(growth[-1])
+    cumulative_return = total_growth - 1.0
     years = n_periods / periods_per_year
-    ann_return = (1 + cum_return) ** (1 / years) - 1 if years > 0 else 0
-
-    # Annualized volatility
-    ann_vol = returns.std() * np.sqrt(periods_per_year)
-
-    # Sharpe ratio
-    rf_per_period = (1 + risk_free_rate) ** (1 / periods_per_year) - 1
-    excess_returns = returns - rf_per_period
-    sharpe = (excess_returns.mean() / returns.std()) * np.sqrt(periods_per_year) if returns.std() > 0 else 0
-
-    # Sortino ratio
-    downside = returns[returns < 0]
-    downside_std = downside.std() * np.sqrt(periods_per_year)
-    sortino = (ann_return - risk_free_rate) / downside_std if downside_std > 0 else 0
-
-    # Max drawdown
-    cum_curve = (1 + returns).cumprod()
-    rolling_max = cum_curve.cummax()
-    drawdown = cum_curve / rolling_max - 1
-    max_dd = drawdown.min()
-
-    # Hit rate
-    hit_rate = (returns > 0).mean()
-
-    # Average weekly return
-    avg_return = returns.mean()
-
-    # Calmar ratio
-    calmar = ann_return / abs(max_dd) if max_dd != 0 else 0
-
-    # Win/Loss ratio
-    wins = returns[returns > 0]
-    losses = returns[returns < 0]
-    win_loss = wins.mean() / abs(losses.mean()) if len(losses) > 0 and losses.mean() != 0 else 0
-
-    # Profit factor
-    profit_factor = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else 0
-
-    # VaR and CVaR (95%)
-    var_95 = returns.quantile(0.05)
-    cvar_95 = returns[returns <= var_95].mean() if len(returns[returns <= var_95]) > 0 else var_95
+    annual_return = total_growth ** (1.0 / years) - 1.0 if total_growth > 0 else -1.0
+    annual_volatility = float(values.std(ddof=1) * np.sqrt(periods_per_year)) if n_periods > 1 else 0.0
+    rf_period = (1.0 + risk_free_rate) ** (1.0 / periods_per_year) - 1.0
+    excess = values_array - rf_period
+    standard_deviation = float(np.std(values_array, ddof=1)) if n_periods > 1 else 0.0
+    sharpe = float(np.mean(excess) / standard_deviation * np.sqrt(periods_per_year)) if standard_deviation > 0 else 0.0
+    downside_deviation = float(np.sqrt(np.mean(np.minimum(excess, 0.0) ** 2)) * np.sqrt(periods_per_year))
+    sortino = float((annual_return - risk_free_rate) / downside_deviation) if downside_deviation > 0 else 0.0
+    equity = np.concatenate(([1.0], growth))
+    peaks = np.maximum.accumulate(equity)
+    max_drawdown = float(np.min(equity / peaks - 1.0))
+    wins = values[values > 0]
+    losses = values[values < 0]
+    win_loss = float(wins.mean() / abs(losses.mean())) if len(wins) and len(losses) else 0.0
+    profit_factor = float(wins.sum() / abs(losses.sum())) if len(losses) and losses.sum() != 0 else 0.0
+    var_95 = float(values.quantile(0.05))
+    cvar_95 = float(values[values <= var_95].mean()) if (values <= var_95).any() else var_95
 
     return {
-        'Cumulative Return': cum_return,
-        'Annualized Return': ann_return,
-        'Annualized Volatility': ann_vol,
-        'Sharpe Ratio': sharpe,
-        'Sortino Ratio': sortino,
-        'Max Drawdown': max_dd,
-        'Hit Rate': hit_rate,
-        'Avg Weekly Return': avg_return,
-        'Calmar Ratio': calmar,
-        'Win/Loss Ratio': win_loss,
-        'Profit Factor': profit_factor,
-        'VaR (95%)': var_95,
-        'CVaR (95%)': cvar_95,
-        'Num Weeks': n_periods,
+        "Cumulative Return": cumulative_return,
+        "Annualized Return": annual_return,
+        "Annualized Volatility": annual_volatility,
+        "Sharpe Ratio": sharpe,
+        "Sortino Ratio": sortino,
+        "Max Drawdown": max_drawdown,
+        "Hit Rate": float((values > 0).mean()),
+        "Avg Weekly Return": float(values.mean()),
+        "Calmar Ratio": float(annual_return / abs(max_drawdown)) if max_drawdown else 0.0,
+        "Win/Loss Ratio": win_loss,
+        "Profit Factor": profit_factor,
+        "VaR (95%)": var_95,
+        "CVaR (95%)": cvar_95,
+        "Num Weeks": int(n_periods),
     }
 
 
-def bootstrap_sharpe_ci(returns, n_bootstrap=10000, ci=0.95):
-    """Bootstrap confidence interval for Sharpe ratio."""
-    returns = returns.dropna().values
-    sharpes = []
-    for _ in range(n_bootstrap):
-        sample = np.random.choice(returns, size=len(returns), replace=True)
-        if sample.std() > 0:
-            s = sample.mean() / sample.std() * np.sqrt(52)
-            sharpes.append(s)
-    alpha = (1 - ci) / 2
-    return np.percentile(sharpes, alpha * 100), np.percentile(sharpes, (1 - alpha) * 100)
+def cost_adjusted_portfolio_returns(
+    portfolio: pd.DataFrame,
+    transaction_cost_bps: float,
+) -> pd.Series:
+    """Reprice an already-generated portfolio path under another cost rate.
+
+    Positions and signals remain fixed. The calculation changes only the cost
+    charged on the recorded traded notional, which makes cost stress tests
+    comparable without retraining or changing portfolio decisions.
+    """
+    required = {"gross_return", "traded_notional"}
+    missing = required - set(portfolio.columns)
+    if missing:
+        raise ValueError(f"Portfolio path is missing fields: {', '.join(sorted(missing))}")
+    if not np.isfinite(transaction_cost_bps) or transaction_cost_bps < 0:
+        raise ValueError("transaction_cost_bps cannot be negative.")
+    gross = pd.to_numeric(portfolio["gross_return"], errors="coerce")
+    traded = pd.to_numeric(portfolio["traded_notional"], errors="coerce")
+    if (
+        not np.isfinite(gross.to_numpy(dtype=float)).all()
+        or not np.isfinite(traded.to_numpy(dtype=float)).all()
+        or (traded < 0).any()
+    ):
+        raise ValueError("Portfolio gross returns and traded notional must be finite and non-negative where required.")
+    cost = (transaction_cost_bps / 10_000.0) * traded
+    return ((1.0 + gross) * (1.0 - cost) - 1.0).rename("net_return")
 
 
-def monte_carlo_test(weekly_data, strategy_sharpe, tickers, n_sims=5000, top_n=2):
-    """Monte Carlo permutation test: is strategy better than random selection?"""
-    all_weeks = weekly_data.index.unique().sort_values()
-    # Build return matrix: weeks x stocks
-    return_matrix = weekly_data.pivot_table(
-        values='forward_return', index=weekly_data.index, columns='ticker'
-    )
-    return_matrix = return_matrix.dropna()
+def _circular_block_sample(values: np.ndarray, block_size: int, rng: np.random.Generator) -> np.ndarray:
+    n = len(values)
+    count = math.ceil(n / block_size)
+    starts = rng.integers(0, n, size=count)
+    blocks = [values[(start + np.arange(block_size)) % n] for start in starts]
+    return np.concatenate(blocks)[:n]
 
-    random_sharpes = []
+
+def _sharpe_from_values(values: np.ndarray, risk_free_rate: float, periods_per_year: int) -> float:
+    if len(values) < 2:
+        return 0.0
+    rf_period = (1.0 + risk_free_rate) ** (1.0 / periods_per_year) - 1.0
+    std = float(np.std(values, ddof=1))
+    return float((np.mean(values - rf_period) / std) * np.sqrt(periods_per_year)) if std else 0.0
+
+
+def bootstrap_sharpe_ci(
+    returns: pd.Series,
+    n_bootstrap: int = 5_000,
+    ci: float = 0.95,
+    *,
+    risk_free_rate: float = 0.04,
+    periods_per_year: int = 52,
+    block_size: int = 8,
+    random_state: int = 42,
+) -> tuple[float, float]:
+    """Circular moving-block interval for Sharpe, preserving short-run dependence."""
+    values = pd.to_numeric(pd.Series(returns), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
+    if len(values) < 2 or n_bootstrap < 1 or not 0 < ci < 1:
+        raise ValueError("Need two returns, a positive bootstrap count, and 0 < ci < 1.")
+    block_size = max(1, min(int(block_size), len(values)))
+    rng = np.random.default_rng(random_state)
+    sharpes = np.empty(n_bootstrap, dtype=float)
+    for index in range(n_bootstrap):
+        sample = _circular_block_sample(values, block_size, rng)
+        sharpes[index] = _sharpe_from_values(sample, risk_free_rate, periods_per_year)
+    alpha = (1.0 - ci) / 2.0
+    return float(np.quantile(sharpes, alpha)), float(np.quantile(sharpes, 1.0 - alpha))
+
+
+def bootstrap_mean_difference_ci(
+    strategy: pd.Series,
+    benchmark: pd.Series,
+    *,
+    n_bootstrap: int = 5_000,
+    ci: float = 0.95,
+    periods_per_year: int = 52,
+    block_size: int = 8,
+    random_state: int = 42,
+) -> tuple[float, float]:
+    """Paired block interval for annualized arithmetic excess return."""
+    pair = pd.concat({"strategy": strategy, "benchmark": benchmark}, axis=1).dropna()
+    differences = (pair["strategy"] - pair["benchmark"]).to_numpy(dtype=float)
+    if len(differences) < 2 or n_bootstrap < 1 or not 0 < ci < 1:
+        raise ValueError("Need two matched pairs, a positive bootstrap count, and 0 < ci < 1.")
+    block_size = max(1, min(int(block_size), len(differences)))
+    rng = np.random.default_rng(random_state)
+    estimates = np.empty(n_bootstrap, dtype=float)
+    for index in range(n_bootstrap):
+        sample = _circular_block_sample(differences, block_size, rng)
+        estimates[index] = sample.mean() * periods_per_year
+    alpha = (1.0 - ci) / 2.0
+    return float(np.quantile(estimates, alpha)), float(np.quantile(estimates, 1.0 - alpha))
+
+
+def monte_carlo_test(
+    weekly_data: pd.DataFrame,
+    strategy_sharpe: float,
+    tickers: list[str],
+    n_sims: int = 5_000,
+    top_n: int = 2,
+    *,
+    transaction_cost_bps: float = 10,
+    risk_free_rate: float = 0.04,
+    periods_per_year: int = 52,
+    random_state: int = 42,
+    universe_by_week: dict[pd.Timestamp, set[str]] | None = None,
+) -> tuple[float, list[float]]:
+    """Compare with random weekly picks under matched costs and Sharpe settings."""
+    if n_sims < 1 or top_n < 1:
+        raise ValueError("n_sims and top_n must be positive.")
+    if universe_by_week is None:
+        matrix = weekly_data.pivot_table(
+            values="forward_return", index=weekly_data.index, columns="ticker", aggfunc="first"
+        ).reindex(columns=tickers).dropna(how="any").sort_index()
+        if matrix.empty or top_n > len(matrix.columns):
+            raise ValueError("Not enough complete weekly returns for the random portfolio comparison.")
+        weekly_candidates = [
+            {str(name): float(value) for name, value in row.items()}
+            for _, row in matrix.iterrows()
+        ]
+    else:
+        weekly_candidates = []
+        for week, group in weekly_data.groupby(level=0, sort=True):
+            expected = set(universe_by_week.get(pd.Timestamp(week), set()))
+            valid = group.loc[group["ticker"].astype(str).isin(expected)].dropna(subset=["forward_return"])
+            row = dict(zip(valid["ticker"].astype(str), valid["forward_return"].astype(float)))
+            if len(row) >= top_n:
+                weekly_candidates.append(row)
+        if not weekly_candidates:
+            raise ValueError("Not enough complete weekly returns for the random portfolio comparison.")
+
+    rng = np.random.default_rng(random_state)
+    cost_rate = transaction_cost_bps / 10_000.0
+    random_sharpes: list[float] = []
     for _ in range(n_sims):
-        random_returns = []
-        for _, row in return_matrix.iterrows():
-            picks = np.random.choice(len(tickers), top_n, replace=False)
-            random_returns.append(row.iloc[picks].mean())
-        random_returns = np.array(random_returns)
-        if random_returns.std() > 0:
-            rs = random_returns.mean() / random_returns.std() * np.sqrt(52)
-            random_sharpes.append(rs)
+        previous_weights: dict[str, float] = {}
+        path = np.empty(len(weekly_candidates), dtype=float)
+        for week_index, row in enumerate(weekly_candidates):
+            names = np.asarray(sorted(row), dtype=object)
+            picks = rng.choice(names, size=min(top_n, len(names)), replace=False)
+            current_weights = {str(name): 1.0 / len(picks) for name in picks}
+            traded = _portfolio_turnover(previous_weights, current_weights)
+            gross = float(sum(weight * row[ticker] for ticker, weight in current_weights.items()))
+            path[week_index] = (1.0 + gross) * (1.0 - cost_rate * traded) - 1.0
+            ending_value = 1.0 + gross
+            if ending_value > 0:
+                previous_weights = {
+                    ticker: weight * (1.0 + row[ticker]) / ending_value
+                    for ticker, weight in current_weights.items()
+                }
+        random_sharpes.append(_sharpe_from_values(path, risk_free_rate, periods_per_year))
+    p_value = (1 + sum(value >= strategy_sharpe for value in random_sharpes)) / (n_sims + 1)
+    return float(p_value), random_sharpes
 
-    p_value = np.mean(np.array(random_sharpes) >= strategy_sharpe)
-    return p_value, random_sharpes
 
-
-def compute_information_coefficient(predictions):
-    """Compute weekly Information Coefficient (Spearman correlation)."""
+def compute_information_coefficient(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Compute weekly cross-sectional Spearman IC from raw class probabilities."""
+    required = {"week", "ensemble_prob", "actual_return"}
+    if not required.issubset(predictions.columns):
+        raise ValueError("predictions must contain week, ensemble_prob, and actual_return columns.")
     weekly_ics = []
-    for week in predictions['week'].unique():
-        week_data = predictions[predictions['week'] == week]
-        if len(week_data) >= 5:
-            ic, _ = spearmanr(week_data['ensemble_prob'], week_data['actual_return'])
-            if not np.isnan(ic):
-                weekly_ics.append({'week': week, 'ic': ic})
-    ic_df = pd.DataFrame(weekly_ics).set_index('week')
-    return ic_df
+    for week, week_data in predictions.groupby("week", sort=True):
+        values = week_data[["ensemble_prob", "actual_return"]].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(values) >= 5 and values["ensemble_prob"].nunique() > 1 and values["actual_return"].nunique() > 1:
+            ic, _ = spearmanr(values["ensemble_prob"], values["actual_return"])
+            if np.isfinite(ic):
+                weekly_ics.append({"week": week, "ic": float(ic), "n_stocks": int(len(values))})
+    if not weekly_ics:
+        return pd.DataFrame(columns=["ic", "n_stocks"]).rename_axis("week")
+    return pd.DataFrame(weekly_ics).set_index("week").sort_index()

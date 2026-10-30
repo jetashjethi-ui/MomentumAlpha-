@@ -1,6 +1,15 @@
 # Cache and data files
 cached_data.pkl
 *.pkl
+.cache/
+.runs/
+.venv/
+.pytest_cache/
+.ruff_cache/
+run_summary.json
+portfolio_returns.csv
+information_coefficient.csv
+walk_forward_fits.csv
 
 # Python
 __pycache__/
@@ -38,3 +47,6 @@ report.md
 # Environment
 .env
 venv/
+
+# Local archive of superseded materials
+/archive/

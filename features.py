@@ -6,7 +6,6 @@ features, and cross-sectional rankings for each stock.
 import pandas as pd
 import numpy as np
 import ta
-from scipy.stats import entropy as scipy_entropy
 
 
 def compute_momentum_features(df):
@@ -52,11 +51,21 @@ def compute_momentum_features(df):
     features['consec_up'] = daily_ret.gt(0).groupby((~daily_ret.gt(0)).cumsum()).cumsum()
     features['consec_down'] = daily_ret.lt(0).groupby((~daily_ret.lt(0)).cumsum()).cumsum()
 
-    # Linear regression slope (20d)
-    features['lr_slope_20'] = close.rolling(20).apply(
-        lambda x: np.polyfit(range(len(x)), x, 1)[0] / x.mean() if len(x) == 20 else np.nan,
-        raw=True
+    # Closed-form rolling least-squares slope avoids a separate polyfit for
+    # every stock-day while preserving the original normalized slope.
+    window = 20
+    centered_time = np.arange(window, dtype=float) - (window - 1) / 2
+    slope_denominator = float(np.dot(centered_time, centered_time))
+    close_values = pd.to_numeric(close, errors='coerce').to_numpy(dtype=float)
+    weighted_sums = np.convolve(
+        np.nan_to_num(close_values, nan=0.0), centered_time[::-1], mode='valid'
     )
+    rolling_mean = close.rolling(window, min_periods=window).mean().to_numpy(dtype=float)
+    slopes = weighted_sums / slope_denominator / rolling_mean[window - 1:]
+    slope_values = np.full(len(close), np.nan, dtype=float)
+    slope_values[window - 1:] = slopes
+    slope_values[close.rolling(window, min_periods=window).count().to_numpy() < window] = np.nan
+    features['lr_slope_20'] = slope_values
 
     return features
 
@@ -90,9 +99,8 @@ def compute_volatility_features(df):
     # Garman-Klass volatility
     log_hl = np.log(high / low) ** 2
     log_co = np.log(close / open_) ** 2
-    features['gk_vol'] = np.sqrt(
-        (0.5 * log_hl - (2 * np.log(2) - 1) * log_co).rolling(20).mean()
-    )
+    gk_variance = (0.5 * log_hl - (2 * np.log(2) - 1) * log_co).rolling(20).mean()
+    features['gk_vol'] = np.sqrt(gk_variance.clip(lower=0))
 
     # Intraday range
     features['intraday_range'] = (high - low) / close
@@ -142,7 +150,8 @@ def compute_volume_features(df):
     features['force_index'] = (close.pct_change() * volume).ewm(span=13).mean()
 
     # Volume spike
-    features['volume_spike'] = (volume > 2 * volume.rolling(20).mean()).astype(int)
+    volume_mean_20 = volume.rolling(20, min_periods=20).mean()
+    features['volume_spike'] = (volume > 2 * volume_mean_20).where(volume_mean_20.notna())
 
     return features
 
@@ -201,9 +210,7 @@ def compute_candle_features(df):
 
     # Autocorrelation
     daily_ret = close.pct_change()
-    features['autocorr_1'] = daily_ret.rolling(20).apply(
-        lambda x: x.autocorr(lag=1) if len(x) >= 5 else np.nan, raw=False
-    )
+    features['autocorr_1'] = daily_ret.rolling(20, min_periods=20).corr(daily_ret.shift(1))
 
     return features
 
@@ -223,13 +230,15 @@ def compute_calendar_features(df):
     return features
 
 
-def compute_market_regime_features(stock_df, spy_data, vix_data):
+def compute_market_regime_features(stock_df, spy_data, vix_data=None):
     """Compute market regime features using SPY and VIX."""
     features = pd.DataFrame(index=stock_df.index)
 
     # Align indices
     spy_close = spy_data['Close'].reindex(stock_df.index, method='ffill')
-    vix_close = vix_data['Close'].reindex(stock_df.index, method='ffill')
+    vix_close = None
+    if vix_data is not None and not vix_data.empty and 'Close' in vix_data:
+        vix_close = vix_data['Close'].reindex(stock_df.index, method='ffill')
 
     # SPY returns
     for w in [5, 10, 20]:
@@ -240,10 +249,11 @@ def compute_market_regime_features(stock_df, spy_data, vix_data):
     spy_sma200 = spy_close.rolling(200).mean()
     features['spy_trend'] = spy_sma50 / spy_sma200
 
-    # VIX features
-    features['vix_level'] = vix_close
-    features['vix_change_5d'] = vix_close.pct_change(5)
-    features['vix_pct_rank'] = vix_close.rolling(60).rank(pct=True)
+    # VIX is optional for providers that do not carry the volatility index.
+    if vix_close is not None:
+        features['vix_level'] = vix_close
+        features['vix_change_5d'] = vix_close.pct_change(5)
+        features['vix_pct_rank'] = vix_close.rolling(60).rank(pct=True)
 
     # Stock beta (rolling 60-day)
     stock_ret = stock_df['Close'].pct_change()
@@ -264,7 +274,7 @@ def compute_market_regime_features(stock_df, spy_data, vix_data):
     return features
 
 
-def compute_all_features(stock_data, spy_data, vix_data, tickers):
+def compute_all_features(stock_data, spy_data, vix_data, tickers, *, include_cross_sectional=True):
     """
     Compute all features for all stocks. Returns a dict of DataFrames.
     stock_data: dict of {ticker: DataFrame with OHLCV}
@@ -293,7 +303,8 @@ def compute_all_features(stock_data, spy_data, vix_data, tickers):
         all_features[ticker] = features
 
     # Compute cross-sectional features
-    all_features = compute_cross_sectional_features(all_features, tickers)
+    if include_cross_sectional:
+        all_features = compute_cross_sectional_features(all_features, tickers)
 
     return all_features
 
@@ -331,7 +342,8 @@ def compute_cross_sectional_features(all_features, tickers):
         all_features[ticker]['cs_dispersion'] = ret_5d.std(axis=1)
 
         # Market breadth
-        all_features[ticker]['cs_breadth'] = (ret_5d > 0).sum(axis=1) / len(tickers)
+        available = ret_5d.notna().sum(axis=1).replace(0, np.nan)
+        all_features[ticker]['cs_breadth'] = (ret_5d > 0).sum(axis=1) / available
 
     return all_features
 
@@ -341,41 +353,48 @@ def compute_lagged_target_features(weekly_df, tickers):
     Compute lagged target / return-based features at weekly level.
     These use PAST targets only — no look-ahead bias.
     """
-    for ticker in tickers:
-        mask = weekly_df['ticker'] == ticker
-        ticker_data = weekly_df.loc[mask].copy()
+    weekly_df = weekly_df.copy()
+    ticker_groups = weekly_df.groupby('ticker', sort=False)
 
-        # Lagged forward returns (past realized — safe because they are PAST values)
-        for lag in [1, 2, 3, 4]:
-            weekly_df.loc[mask, f'lag_return_{lag}w'] = ticker_data['forward_return'].shift(lag + 1).values
+    # Grouped shifts replace repeated full-frame ticker masks and keep each
+    # security era isolated, including when a ticker symbol is reused.
+    for lag in [1, 2, 3, 4]:
+        weekly_df[f'lag_return_{lag}w'] = ticker_groups['forward_return'].shift(lag + 1)
 
-        # Past win rate (rolling fraction of positive weeks)
-        past_positive = (ticker_data['forward_return'].shift(1) > 0).astype(float)
-        for w in [4, 8, 13, 26]:
-            weekly_df.loc[mask, f'win_rate_{w}w'] = past_positive.rolling(w, min_periods=2).mean().values
-
-        # Past return momentum (average of last N weeks)
-        past_ret = ticker_data['forward_return'].shift(1)
-        for w in [4, 8, 13]:
-            weekly_df.loc[mask, f'avg_past_ret_{w}w'] = past_ret.rolling(w, min_periods=2).mean().values
-
-        # Return reversal signal
-        weekly_df.loc[mask, 'reversal_1w'] = -ticker_data['forward_return'].shift(1).values
-
-        # Volatility of past returns
-        for w in [8, 13]:
-            weekly_df.loc[mask, f'ret_vol_{w}w'] = past_ret.rolling(w, min_periods=4).std().values
-
-        # Max drawdown over past 13 weeks
-        past_cum = (1 + past_ret).rolling(13, min_periods=4).apply(
-            lambda x: (x.cumprod() / x.cumprod().cummax() - 1).min(), raw=False
+    # Open-to-open labels need two calendar rows to mature before the next
+    # signal; every rolling statistic below uses only those matured outcomes.
+    realized_return = ticker_groups['forward_return'].shift(2)
+    past_positive = realized_return.gt(0).astype(float).where(realized_return.notna())
+    positive_groups = past_positive.groupby(weekly_df['ticker'], sort=False)
+    realized_groups = realized_return.groupby(weekly_df['ticker'], sort=False)
+    for window in [4, 8, 13, 26]:
+        weekly_df[f'win_rate_{window}w'] = positive_groups.transform(
+            lambda values: values.rolling(window, min_periods=2).mean()
         )
-        weekly_df.loc[mask, 'past_maxdd_13w'] = past_cum.values
+    for window in [4, 8, 13]:
+        weekly_df[f'avg_past_ret_{window}w'] = realized_groups.transform(
+            lambda values: values.rolling(window, min_periods=2).mean()
+        )
+    weekly_df['reversal_1w'] = -realized_return
+    for window in [8, 13]:
+        weekly_df[f'ret_vol_{window}w'] = realized_groups.transform(
+            lambda values: values.rolling(window, min_periods=4).std()
+        )
 
+    def trailing_drawdown(values):
+        wealth = np.cumprod(1.0 + values)
+        peaks = np.maximum.accumulate(wealth)
+        return float(np.min(wealth / peaks - 1.0))
+
+    weekly_df['past_maxdd_13w'] = realized_groups.transform(
+        lambda values: (1.0 + values).rolling(13, min_periods=4).apply(
+            trailing_drawdown, raw=True
+        )
+    )
     return weekly_df
 
 
-def prepare_weekly_dataset(all_features, stock_data, tickers):
+def prepare_weekly_dataset(all_features, stock_data, tickers, dividends=None):
     """
     Resample to weekly, create target variable, and combine into single DataFrame.
     """
@@ -385,25 +404,82 @@ def prepare_weekly_dataset(all_features, stock_data, tickers):
         feat = all_features[ticker].copy()
         price = stock_data[ticker]['Close'].copy()
 
-        # Resample features to weekly (Friday close)
+        # Resample features to the last available close in each Friday-ending
+        # week. Keep the actual signal date for holiday weeks.
         weekly_feat = feat.resample('W-FRI').last()
 
-        # Weekly closing price
+        # A close-derived signal cannot realistically be filled at that same
+        # close. Simulate execution at the next trading week's open and hold to
+        # the following week's open.
         weekly_price = price.resample('W-FRI').last()
+        open_price = stock_data[ticker]['Open'].astype(float)
+        weekly_open = open_price.resample('W-FRI').first()
+        weekly_first_date = pd.Series(open_price.index, index=open_price.index).resample('W-FRI').first()
+        weekly_signal_date = pd.Series(feat.index, index=feat.index).resample('W-FRI').last()
 
-        # Target: forward 1-week return > 0
-        forward_return = weekly_price.shift(-1) / weekly_price - 1
+        entry_price = weekly_open.shift(-1).reindex(weekly_feat.index)
+        exit_price = weekly_open.shift(-2).reindex(weekly_feat.index)
+        entry_date = weekly_first_date.shift(-1).reindex(weekly_feat.index)
+        label_end_date = weekly_first_date.shift(-2).reindex(weekly_feat.index)
+        signal_date = weekly_signal_date.reindex(weekly_feat.index)
+        cash_dividends = pd.Series(0.0, index=weekly_feat.index)
+        dividend_events = (dividends or {}).get(ticker)
+        if dividend_events is not None and not dividend_events.empty:
+            event_dates = pd.DatetimeIndex(dividend_events.index).tz_localize(None).normalize().to_numpy(dtype='datetime64[ns]')
+            event_amounts = pd.to_numeric(dividend_events, errors='coerce').fillna(0.0).to_numpy(dtype=float)
+            cumulative_amounts = np.concatenate(([0.0], np.cumsum(event_amounts)))
+            valid_dates = entry_date.notna() & label_end_date.notna()
+            if valid_dates.any():
+                entry_values = pd.DatetimeIndex(entry_date.loc[valid_dates]).tz_localize(None).normalize().to_numpy(dtype='datetime64[ns]')
+                exit_values = pd.DatetimeIndex(label_end_date.loc[valid_dates]).tz_localize(None).normalize().to_numpy(dtype='datetime64[ns]')
+                first_event = np.searchsorted(event_dates, entry_values, side='right')
+                last_event = np.searchsorted(event_dates, exit_values, side='right')
+                cash_dividends.loc[valid_dates] = cumulative_amounts[last_event] - cumulative_amounts[first_event]
+        forward_return = (exit_price + cash_dividends) / entry_price - 1
         weekly_feat['forward_return'] = forward_return
-        weekly_feat['target'] = (forward_return > 0).astype(int)
+        weekly_feat['target'] = forward_return.gt(0).where(forward_return.notna()).astype(float)
+        weekly_feat['cash_dividends'] = cash_dividends
 
         weekly_feat['ticker'] = ticker
         weekly_feat['close'] = weekly_price
+        weekly_feat['entry_price'] = entry_price
+        weekly_feat['exit_price'] = exit_price
+        weekly_feat['signal_date'] = signal_date
+        weekly_feat['entry_date'] = entry_date
+        weekly_feat['label_end_date'] = label_end_date
 
         weekly_dfs.append(weekly_feat)
 
     combined = pd.concat(weekly_dfs, axis=0).sort_index()
 
-    # Drop rows with NaN target (last week)
-    combined = combined.dropna(subset=['target'])
+    # Keep weeks whose future return is still unknown. The walk-forward engine
+    # excludes these labels until their scheduled exit date; retaining the rows
+    # preserves true calendar-week offsets for lagged target features.
 
     return combined
+
+
+def compute_weekly_cross_sectional_features(weekly_df):
+    """Add relative features using each signal week's actual eligible universe."""
+    if weekly_df.empty:
+        return weekly_df
+    weekly_df = weekly_df.copy()
+    grouped = weekly_df.groupby(level=0, sort=False)
+    for column, output in (
+        ('return_5d', 'cs_ret5d_rank'),
+        ('return_20d', 'cs_ret20d_rank'),
+        ('rsi_14', 'cs_rsi_rank'),
+        ('vol_20d', 'cs_vol_rank'),
+        ('rel_volume_20d', 'cs_relvol_rank'),
+    ):
+        weekly_df[output] = grouped[column].rank(pct=True) if column in weekly_df else np.nan
+    if 'return_5d' in weekly_df:
+        means = grouped['return_5d'].transform('mean')
+        deviations = grouped['return_5d'].transform('std')
+        weekly_df['cs_ret5d_zscore'] = (weekly_df['return_5d'] - means) / deviations.replace(0, np.nan)
+        weekly_df['cs_rel_strength'] = weekly_df['return_5d'] / means.replace(0, np.nan)
+        weekly_df['cs_dispersion'] = deviations
+        positive = weekly_df['return_5d'].gt(0).groupby(level=0).transform('sum')
+        available = weekly_df['return_5d'].notna().groupby(level=0).transform('sum').replace(0, np.nan)
+        weekly_df['cs_breadth'] = positive / available
+    return weekly_df
