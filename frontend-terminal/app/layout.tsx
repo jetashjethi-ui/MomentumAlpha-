@@ -19,7 +19,6 @@ export const metadata: Metadata = {
   title: "MomentumAlpha — Research Terminal",
   description:
     "Local research terminal for systematic equity momentum: backtest performance, model evidence, data provenance and experiments.",
-  generator: "v0.app",
   icons: {
     icon: [
       {

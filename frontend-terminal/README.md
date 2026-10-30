@@ -1,25 +1,17 @@
-# MomentumAlpha Terminal (v0 frontend)
+# MomentumAlpha Terminal
 
-This is the v0-generated frontend integrated with the existing Project3 FastAPI backend. The visual components, colors, layout, motion, and typography are kept from the supplied v0 ZIP. Only the run-form defaults and allowed value ranges were aligned to the backend's validated request schema.
+This directory contains the Next.js dashboard. The main repository README has the project overview, backend setup, research status, API routes, and development commands.
 
-## Run locally on Windows
+The terminal reads real run summaries and artifacts from FastAPI. It does not launch model fitting on page load. To populate a fresh clone, start the backend and dashboard, then explicitly submit a run in the Experiments section.
 
-1. In a first PowerShell window, start the backend from the Project3 root:
+## Local development
 
-   ```powershell
-   Set-Location "$env:USERPROFILE\Desktop\Project3"
-   .\.venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1
-   ```
+From the repository root, start FastAPI:
 
-2. In a second PowerShell window, start this frontend:
+    .\.venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1
 
-   ```powershell
-   Set-Location "$env:USERPROFILE\Desktop\Project3"
-   .\frontend-terminal\run-dev.ps1
-   ```
+Then, in a second PowerShell window, run:
 
-3. Open `http://127.0.0.1:3000/`.
+    .\frontend-terminal\run-dev.ps1
 
-The frontend proxies `/health`, `/ready`, and `/runs` calls to `http://127.0.0.1:8000` through `next.config.mjs`. It uses real run summaries, verification reports, and CSV artifacts from the backend. It does not start model training automatically. Launching a development run is an explicit action in the Experiments section; final-holdout evaluation stays behind a separate confirmation.
-
-The launch form defaults match the previously used Dolt development configuration: 2012 start, 2022 initial training cutoff, 50-security universe, 5 holdings, 13-week retraining, 10 bps costs, four jobs, and 2,000 bootstrap/random simulations. Advanced inputs follow the request bounds in `api.py`.
+The script installs the locked dependencies when needed and proxies API routes to http://127.0.0.1:8000. The app opens at http://127.0.0.1:3000/.

@@ -22,14 +22,12 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from experiment_ledger import ExperimentLedger
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-FRONTEND_DIR = PROJECT_DIR / "frontend"
 RUNS_DIR = PROJECT_DIR / ".runs"
 JOBS_DB = RUNS_DIR / "api_jobs.sqlite3"
 DEFAULT_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "JPM", "V", "JNJ", "BRK-B"]
@@ -491,12 +489,11 @@ def get_artifact(run_id: str, artifact_name: str) -> FileResponse:
 
 
 @app.get("/", include_in_schema=False)
-def dashboard() -> FileResponse:
-    index = FRONTEND_DIR / "index.html"
-    if not index.is_file():
-        raise HTTPException(status_code=404, detail="MomentumAlpha dashboard is not installed.")
-    return FileResponse(index)
-
-
-# Keep the dashboard same-origin with the local API, so no permissive CORS policy is needed.
-app.mount("/assets", StaticFiles(directory=FRONTEND_DIR), name="frontend-assets")
+def service_info() -> dict[str, str]:
+    return {
+        "service": "MomentumAlpha Research API",
+        "version": API_VERSION,
+        "health": "/health",
+        "readiness": "/ready",
+        "documentation": "/docs",
+    }
